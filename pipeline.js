@@ -582,10 +582,10 @@ Use only facts written in the item, and spell names exactly as the item does. Ne
 
 Examples of the style:
 
-1. Source: Meta AI
-Title: Introducing Llama 3.1: Our most capable models to date
-Details: Llama 3.1 comes in 8B, 70B and 405B sizes, with a 128K-token context window and support for eight languages.
-{"pick": 1, "headline": "Meta's biggest open Llama model reaches 405B parameters", "dek": "Llama 3.1 comes in three sizes, each with a 128K-token context window and eight languages."}
+1. Source: Mistral AI
+Title: Mistral Releases Codestral, a 22B Code Model
+Details: Codestral is a 22B open-weight model for code generation, trained on more than 80 programming languages, with a 32K-token context window.
+{"pick": 1, "headline": "Mistral's Codestral writes code in more than 80 languages", "dek": "The 22B open-weight model reads 32K tokens of context at once."}
 
 1. Source: GitHub
 Title: GitHub repo browser-use by browser-use
@@ -631,7 +631,11 @@ function storyProblems({ headline, dek }, f) {
   if(/:/.test(headline)) hard.push("the headline has a colon");
   if(/[A-Za-z][\w.-]*\/[A-Za-z][\w.-]+/.test(headline)) hard.push("the headline has an owner/repo name");
   if(/^(it|this|these)\b/i.test(dek)) soft.push(`the dek starts with "${words(dek)[0]}"`);
-  if(/\b(releases?|launch(es)?|announces?|introduces?|unveils?)\b/i.test(headline)) soft.push("the headline only says it was released; say what is new about it");
+  // "Baseten releases joey-1, a 2B decision model" is the press title again, not news
+  const content = words(headline).map(w => bare(w).toLowerCase()).filter(w => w.length > 2 && !PLAIN.has(w));
+  const title = f.title.toLowerCase();
+  if(content.length >= 3 && content.filter(w => title.includes(w)).length / content.length >= 0.75)
+    soft.push(`the headline repeats the item's title; say in your own words what it does or what is new, like "Mistral's Codestral writes code in more than 80 languages"`);
   const filler = `${headline} ${dek}`.match(FILLER);
   if(filler) soft.push(`"${filler[0]}" is filler`);
   // Names and numbers must come from the item
@@ -657,7 +661,7 @@ const parseStory = raw => {
 async function writeStory(cat, topItems, chat) {
   const facts = topItems.map(storyFacts);
   let best = null, feedback = "";
-  for(const temperature of [0.3, 0.5, 0.7]) {
+  for(const temperature of [0.2, 0.5, 0.7]) {
     const raw = await chat(STORY_PROMPT(cat.label, facts) + feedback, { maxTokens:160, temperature, json:true });
     const s = parseStory(raw) || {};
     const story = {
