@@ -485,7 +485,7 @@ function makeChat({ url, key="", model }) {
 }
 
 // Bump when prompts change — build.js drops AI text written by another model or prompt version
-const PROMPT_VERSION = 5;
+const PROMPT_VERSION = 6;
 
 // Cut at a word boundary — a word chopped mid-way gets copied into the output by small models
 const clip = (text, n) => {
@@ -534,7 +534,7 @@ In ONE sentence of at most 14 words, say what this lets them do or what it chang
   if(todo.length) console.log(`Generated ${written} why-this-matters lines for ${todo.length} items`);
 }
 
-// ── Daily digest — category summaries + intro ─────────────────────
+// ── Daily digest — one news story per category + intro ────────────
 const DIGEST_CATS = [
   { id:"model",    label:"Models & Releases" },
   { id:"tool",     label:"Tools & Libraries"  },
@@ -544,7 +544,187 @@ const DIGEST_CATS = [
   { id:"funding",  label:"Funding & Business"  },
 ];
 
-// `prev` is the last digest: a category whose top items haven't changed keeps its summary.
+const SRC_NAME = { HN:"Hacker News", GitHub:"GitHub", arXiv:"arXiv", "Dev.to":"Dev.to", "Lobste.rs":"Lobste.rs" };
+const unescape = s => (s||"")
+  .replace(/&#x([0-9a-f]+);/gi, (_,h) => String.fromCodePoint(parseInt(h,16)))
+  .replace(/&#(\d+);/g, (_,d) => String.fromCodePoint(+d))
+  .replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&amp;/g,"&");
+
+// What the model gets to know about one item — and all it may state
+function storyFacts(i) {
+  const source = i.srcLabel || SRC_NAME[i.src] || i.src;
+  // Feeds append "The post … appeared first on …" — noise that ends up in the story
+  let title = unescape(i.title), details = clip(unescape(i.sum).replace(/\s*The post\b.*$/, ""), 220);
+  if(i.src === "GitHub") {
+    // A bare owner/repo slug gets copied into headlines — spell it out instead
+    const [owner, name] = title.split("/");
+    title = `GitHub repo ${name || owner} by ${owner}`;
+    details = `${details === "No description." ? "" : details} ${(i.score||0).toLocaleString("en-US")} stars.`.trim();
+  } else if(i.src === "HN" || i.src === "Lobste.rs") {
+    if(/^(Discussion on Hacker News|Technical discussion on Lobste\.rs)\.?$/.test(details)) details = "";
+    let site = "";
+    try { site = new URL(i.link).hostname.replace(/^www\./, ""); } catch {}
+    if(/ycombinator\.com|lobste\.rs/.test(site)) site = "";
+    details = `${details} A ${source} thread with ${i.score||0} points and ${i.comments||0} comments${site ? `, linking to ${site}` : ""}.`.trim();
+  }
+  return { source, title, details };
+}
+
+// The category comes last, after the examples: Ollama reuses the cached prompt start across calls,
+// which makes each call several times faster on a CPU runner
+const STORY_PROMPT = (label, facts) => `You are the editor of CobunAI, a daily news brief for developers who build with AI. You turn a list of items into one news story.
+
+Choose the ONE item that is the biggest news for these readers: a launch, release, deal or result beats an essay or an opinion piece. Reply with JSON: {"pick": <item number>, "headline": "...", "dek": "..."}
+
+headline: who did what, in at most 10 words, in sentence case. Start with who (the company, lab, person or project; "Researchers" for a paper), then an active verb. Say what is new about it or what it does differently, not just that it was released or launched. Plain words. No colons, no "owner/repo" names, no title copied word for word.
+dek: one complete sentence of at most 20 words that adds the most concrete fact the headline left out: a number, a name, or what exactly changed. Write it like a newspaper, with "a" and "the" where they belong. Never start it with "It" or "This". No filler such as "simplifying", "enabling", "impacting" or "changing how developers work".
+Use only facts written in the item, and spell names exactly as the item does. Never add numbers, names or claims that are not there.
+
+Examples of the style:
+
+1. Source: Mistral AI
+Title: Mistral Releases Codestral, a 22B Code Model
+Details: Codestral is a 22B open-weight model for code generation, trained on more than 80 programming languages, with a 32K-token context window.
+{"pick": 1, "headline": "Mistral's Codestral writes code in more than 80 languages", "dek": "The 22B open-weight model reads 32K tokens of context at once."}
+
+1. Source: GitHub
+Title: GitHub repo browser-use by browser-use
+Details: Make websites accessible for AI agents. Automate tasks online with ease. 62,000 stars.
+{"pick": 1, "headline": "Browser Use lets AI agents work websites for you", "dek": "The library automates online tasks for agents and has 62,000 stars on GitHub."}
+
+1. Source: arXiv
+Title: Scaling Laws for Neural Language Models
+Details: We study empirical scaling laws for language model performance on the cross-entropy loss. The loss scales as a power-law with model size, dataset size, and the amount of compute used for training.
+{"pick": 1, "headline": "Researchers find language models improve predictably with scale", "dek": "Loss falls as a power law as model size, data and training compute grow."}
+
+Today's top "${label}" items:
+
+${facts.map((f,idx) => `${idx+1}. Source: ${f.source}\nTitle: ${f.title}${f.details ? `\nDetails: ${f.details}` : ""}`).join("\n\n")}
+
+Reply with the JSON only.`;
+
+// Filler small models reach for when there is nothing concrete to say
+const FILLER = /\b(simplif\w*|impact\w*|chang\w* (how|the way)|revolution\w*|game.?chang\w*|streamlin\w*|empower\w*|enabl\w*|seamless\w*|leverag\w*|cutting.edge|groundbreaking|pav\w* the way|landscape)\b/i;
+// Capitalised words that are not names, so they need no backing in the item
+const PLAIN = new Set(("the a an it its this these that their his her our your you new how why what who when after with for in on as at by " +
+  "researchers researcher developers developer engineers engineer scientists users teams people hackers security " +
+  "startup startups company lab study paper report authors experts investors " +
+  "ai llm llms api apis gpu gpus cpu ml open one two three four five six seven eight nine ten").split(" "));
+const words = s => s.split(/\s+/).filter(Boolean);
+const bare = w => w.replace(/^[^\w$]+|[^\w]+$/g, "").replace(/['’]s$/, "");
+// Makers everyone knows from the product name, so "Anthropic's Claude Code" needs no "Anthropic" in the item
+const MAKERS = [[/\bclaude\b/, "anthropic"], [/\b(chatgpt|gpt-?\d|codex|sora)\b/, "openai"], [/\b(gemini|gemma|deepmind)\b/, "google"],
+  [/\bllama\b/, "meta"], [/\bgrok\b/, "xai"], [/\bcopilot\b/, "microsoft github"]];
+const itemText = f => {
+  const t = `${f.source} ${f.title} ${f.details}`.toLowerCase();
+  return t + MAKERS.filter(([re]) => re.test(t)).map(([, maker]) => ` ${maker}`).join("");
+};
+
+// How many of the story's distinctive words come from this item — tells which item it is about
+const overlap = ({ headline, dek }, f) => {
+  const known = itemText(f);
+  return words(`${headline} ${dek}`).map(w => bare(w).toLowerCase())
+    .filter(w => w.length > 3 && !PLAIN.has(w) && known.includes(w)).length;
+};
+
+// What's wrong with a story, judged against the item it is about. Hard problems mean it can't run.
+function storyProblems({ headline, dek }, f) {
+  const hard = [], soft = [];
+  if(!headline || !dek) return { hard:["headline and dek are both required"], soft };
+  const hw = words(headline).length, dw = words(dek).length;
+  if(hw > 10) (hw > 13 ? hard : soft).push(`the headline has ${hw} words, keep it to 10`);
+  if(dw > 20) (dw > 25 ? hard : soft).push(`the dek has ${dw} words, keep it to 20`);
+  if(/:/.test(headline)) hard.push("the headline has a colon");
+  if(/[A-Za-z][\w.-]*\/[A-Za-z][\w.-]+/.test(headline)) hard.push("the headline has an owner/repo name");
+  if(/^(it|this|these)\b/i.test(dek)) soft.push(`the dek starts with "${words(dek)[0]}"`);
+  // In Title Case every word looks like a name, so only the dek's names get checked (sentenceCase fixes the rest)
+  const long = words(headline).filter(w => /^[a-z]/i.test(w) && bare(w).length > 3);
+  const titleCase = long.length >= 3 && long.filter(w => /^[A-Z]/.test(w)).length / long.length >= 0.7;
+  // "Baseten releases joey-1, a 2B decision model" is the press title again, not news
+  const content = words(headline).map(w => bare(w).toLowerCase()).filter(w => w.length > 2 && !PLAIN.has(w));
+  const title = f.title.toLowerCase();
+  if(content.length >= 3 && content.filter(w => title.includes(w)).length / content.length >= 0.75)
+    soft.push(`the headline repeats the item's title; say in your own words what it does or what is new, like "Mistral's Codestral writes code in more than 80 languages"`);
+  const filler = `${headline} ${dek}`.match(FILLER);
+  if(filler) soft.push(`"${filler[0]}" is filler`);
+  // Names and numbers must come from the item
+  const known = itemText(f);
+  const knownNums = known.replace(/(\d),(?=\d)/g, "$1");
+  for(const n of `${headline} ${dek}`.replace(/(\d),(?=\d)/g, "$1").match(/\d+(?:\.\d+)?/g) || [])
+    if(!knownNums.includes(n)) hard.push(`${n} is not in the item`);
+  for(const w of words(titleCase ? dek : `${headline} ${dek}`)) {
+    const name = bare(w);
+    if(!/[A-Z]/.test(name) || PLAIN.has(name.toLowerCase()) || known.includes(name.toLowerCase())) continue;
+    // "OpenAI-backed" is fine when "OpenAI" is in the item
+    if(name.split("-").every(p => !/[A-Z]/.test(p) || PLAIN.has(p.toLowerCase()) || known.includes(p.toLowerCase()))) continue;
+    hard.push(`"${name}" is not in the item`);
+  }
+  return { hard, soft };
+}
+
+// "Phorion Discovers Backdoor in Claude Code" → "Phorion discovers backdoor in Claude Code": a word keeps its
+// capital only as the first word, an acronym or CamelCase name, or where the item itself capitalises it
+function sentenceCase(headline, f) {
+  const plainTitle = words(f.title).some(w => /^[a-z]{4,}$/.test(bare(w))); // a Title Case title proves nothing
+  // A repo slug like cherry-studio is the name "Cherry Studio"
+  const slug = (f.title.match(/^GitHub repo (\S+)/)?.[1] || "").split(/[-_.]/).map(p => p.charAt(0).toUpperCase() + p.slice(1));
+  const evidence = `${f.details} ${plainTitle ? words(f.title).slice(1).join(" ") : ""} ${slug.join(" ")}`;
+  const text = `${f.source} ${f.title} ${f.details}`.toLowerCase();
+  const makers = new Set(MAKERS.filter(([re]) => re.test(text)).flatMap(([, maker]) => maker.split(" ")));
+  return words(headline).map((w, wi) => w.split("-").map((part, pi) => {
+    const name = bare(part);
+    if((wi === 0 && pi === 0) || !/^[A-Z][a-z]+$/.test(name) || evidence.includes(name) || makers.has(name.toLowerCase())) return part;
+    return part.replace(name, name.toLowerCase());
+  }).join("-")).join(" ");
+}
+
+const parseStory = raw => {
+  try { return JSON.parse(raw.match(/\{[\s\S]*\}/)?.[0] || raw); } catch { return null; }
+};
+
+// One headline + dek for a category, about the item the model picked. Retries with the reasons a draft failed.
+async function writeStory(cat, topItems, chat) {
+  const facts = topItems.map(storyFacts);
+  let best = null, feedback = "";
+  for(const temperature of [0.2, 0.6, 0.8, 0.8]) {
+    const raw = await chat(STORY_PROMPT(cat.label, facts) + feedback, { maxTokens:160, temperature, json:true });
+    const s = parseStory(raw) || {};
+    const story = {
+      headline: firstSentences(String(s.headline||""), 1).replace(/[.!]+$/, "").replace(/^["']|["']$/g, "").trim(),
+      dek: firstSentences(String(s.dek||""), 1).replace(/^["']|["']$/g, "").trim(),
+    };
+    if(story.dek && !/[.!?]$/.test(story.dek)) story.dek += ".";
+    // Trust the words over the number: a story that plainly comes from another item is about that item
+    const n = Number(s.pick);
+    let pick = Number.isInteger(n) && n >= 1 && n <= facts.length ? n - 1 : 0;
+    const scores = facts.map(f => overlap(story, f));
+    const likeliest = scores.indexOf(Math.max(...scores));
+    if(scores[likeliest] > scores[pick] + 1) pick = likeliest;
+    let p = storyProblems(story, facts[pick]);
+    if(p.hard.length) {
+      // Another item the story shares words with may back it fully
+      const other = facts.map((f, idx) => idx)
+        .filter(idx => scores[idx] > 0 && scores[idx] >= scores[pick] && !storyProblems(story, facts[idx]).hard.length)
+        .sort((a, b) => scores[b] - scores[a])[0];
+      if(other !== undefined) { pick = other; p = storyProblems(story, facts[pick]); }
+    }
+    const draft = { ...story, lead:topItems[pick].id, hard:p.hard, soft:p.soft };
+    if(!best || draft.hard.length < best.hard.length || (draft.hard.length === best.hard.length && draft.soft.length < best.soft.length)) best = draft;
+    if(!draft.hard.length && !draft.soft.length) break;
+    console.warn(`Digest ${cat.id} draft rejected: "${story.headline}" / "${story.dek}" — ${[...p.hard, ...p.soft].join("; ")}`);
+    // Name the broken rules but don't quote the draft: shown its last draft, the model rewrites it word for word
+    feedback = `\n\nA first draft broke these rules: ${[...p.hard, ...p.soft].join("; ")}. Write a new one that keeps every rule.`;
+  }
+  if(best.hard.length) return null;
+  const f = storyFacts(topItems.find(i => i.id === best.lead));
+  // "Joey-1 costs…" → "joey-1 costs…": a name the item writes in lower case stays that way
+  const first = words(best.dek)[0] || "", known = `${f.title} ${f.details}`;
+  const dek = /[\d-]/.test(first) && first !== first.toLowerCase() && known.includes(bare(first).toLowerCase()) && !known.includes(bare(first))
+    ? first.toLowerCase() + best.dek.slice(first.length) : best.dek;
+  return { headline:sentenceCase(best.headline, f), dek, lead:best.lead };
+}
+
+// `prev` is the last digest: a category whose top items haven't changed keeps its story.
 async function buildDigest(items, chat, prev=null) {
   const now = Math.floor(Date.now()/1000);
   const recent = items.filter(i => now - (i.time||0) < 172800);
@@ -562,22 +742,21 @@ async function buildDigest(items, chat, prev=null) {
   for(const cat of DIGEST_CATS) {
     const catItems = (grouped[cat.id] || []).slice(0,15);
     if(!catItems.length) continue;
-    const topItems = catItems.slice(0,8);
+    const topItems = catItems.slice(0,6);
     const key = topItems.map(i=>i.id).join(",");
-    let summary = prevCats.get(cat.id)?.key === key ? (prevCats.get(cat.id).summary || "") : "";
-    if(!summary && chat) {
-      const prompt = `Today's top "${cat.label}" items for AI developers:
-${topItems.map((i,idx) => `${idx+1}. ${i.title}${i.sum ? " — " + clip(i.sum, 140) : ""}`).join("\n")}
-
-Write a 2-sentence brief, each sentence under 25 words. Begin with the name of the single most important item above and say plainly what it is. The second sentence says what it changes for someone building AI products, in your own words.
-Use only facts stated above — never add numbers, names or details that are not there. Plain prose: no lists, no labels, no hype words, no preamble.`;
+    const old = prevCats.get(cat.id);
+    let story = old?.key === key && old.headline ? { headline:old.headline, dek:old.dek, lead:old.lead } : null;
+    if(!story && chat) {
       try {
-        summary = firstSentences(await chat(prompt, { maxTokens:160 }), 2);
+        story = await writeStory(cat, topItems, chat);
       } catch(e) {
-        console.warn(`Digest summary failed (${cat.id}):`, e.message);
+        console.warn(`Digest story failed (${cat.id}):`, e.message);
       }
     }
-    categories.push({ id:cat.id, label:cat.label, summary, key, count:catItems.length,
+    const { headline="", dek="", lead="" } = story || {};
+    // `summary` is the pre-headline field; the live UI reads it until it moves to headline + dek
+    const summary = headline ? `${headline}. ${dek}` : "";
+    categories.push({ id:cat.id, label:cat.label, headline, dek, lead, summary, key, count:catItems.length,
       items:catItems.map(i=>({id:i.id,title:i.title,src:i.src,srcLabel:i.srcLabel,type:i.type,
         heat:i.heat,time:i.time,link:i.link,sum:i.sum,why:i.why||"",
         score:i.score,comments:i.comments,authors:i.authors||""})) });

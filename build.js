@@ -58,7 +58,7 @@ write("status.json", {
   generatedAt, items:feedItems.length, sources, failed,
   model: aiVersion,
   withWhy: feedItems.filter(i => i.why).length,
-  summaries: digest.categories.filter(c => c.summary).length + "/" + digest.categories.length,
+  stories: digest.categories.filter(c => c.headline).length + "/" + digest.categories.length,
   seconds: Math.round((Date.now()-started)/1000),
 });
 console.log(`📦 Wrote ${feedItems.length} items to ${OUT}/ in ${Math.round((Date.now()-started)/1000)}s`);
