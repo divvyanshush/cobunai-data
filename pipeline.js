@@ -490,7 +490,7 @@ function makeChat({ url, key="", model }) {
 }
 
 // Bump when prompts change — build.js drops AI text written by another model or prompt version
-const PROMPT_VERSION = 8;
+const PROMPT_VERSION = 9;
 
 // Cut at a word boundary — a word chopped mid-way gets copied into the output by small models
 const clip = (text, n) => {
@@ -601,12 +601,13 @@ function storyFacts(i) {
 
 // The category comes last, after the examples: Ollama reuses the cached prompt start across calls,
 // which makes each call several times faster on a CPU runner
-const STORY_PROMPT = (label, facts) => `You are the editor of CobunAI, a daily news brief for developers who build with AI. You turn a list of items into one news story.
+const STORY_PROMPT = (label, facts) => `You are the editor of CobunAI, a daily AI news brief written for anyone: a curious reader who doesn't work in tech should understand every word. You turn a list of items into one short news story.
 
-Choose the ONE item that is the biggest news for these readers: a launch, release, deal or result beats an essay or an opinion piece. Reply with JSON: {"pick": <item number>, "headline": "...", "dek": "..."}
+Choose the ONE item that is the biggest news: a launch, release, deal, discovery or security problem beats an essay or an opinion piece. Reply with JSON: {"pick": <item number>, "headline": "...", "dek": "..."}
 
-headline: who did what, in at most 10 words, in sentence case. Start with who (the company, lab, person or project; "Researchers" for a paper), then an active verb. Say what is new about it or what it does differently, not just that it was released or launched. Plain words. No colons, no "owner/repo" names, no title copied word for word.
-dek: one complete sentence of at most 20 words that adds the most concrete fact the headline left out: a number, a name, or what exactly changed. Write it like a newspaper, with "a" and "the" where they belong. Never start it with "It" or "This". No filler such as "simplifying", "enabling", "impacting" or "changing how developers work".
+headline: who did what, in at most 10 plain words, in sentence case. Start with who (a company, lab, person or project; "Researchers" for a paper), then an active verb. Say what it does for people or what is new, not just that it was released. No colons, no "owner/repo" names, no title copied word for word.
+dek: one short sentence of at most 20 words with the most concrete fact the headline left out, put in everyday terms. Never start it with "It" or "This".
+Plain words only. No tech jargon such as tokens, latency, parameters, benchmark, API, SDK, inference, open-weight or LLM: say what the thing does instead ("a test", "an AI model", "an add-on"). Make numbers human: "20 ms" becomes "a fiftieth of a second", "65.2%" becomes "about two in three". If readers may not know a company, say what it does ("home-alarm company ADT"). No filler such as "simplifying", "enabling", "impacting" or "changing how people work".
 Use only facts written in the item, and spell names exactly as the item does. Never add numbers, names or claims that are not there.
 
 Examples of the style:
@@ -614,17 +615,17 @@ Examples of the style:
 1. Source: Mistral AI
 Title: Mistral Releases Codestral, a 22B Code Model
 Details: Codestral is a 22B open-weight model for code generation, trained on more than 80 programming languages, with a 32K-token context window.
-{"pick": 1, "headline": "Mistral's Codestral writes code in more than 80 languages", "dek": "The 22B open-weight model reads 32K tokens of context at once."}
+{"pick": 1, "headline": "Mistral's Codestral writes code in more than 80 programming languages", "dek": "Anyone can download the AI model and run it themselves."}
 
 1. Source: GitHub
 Title: GitHub repo browser-use by browser-use
 Details: Make websites accessible for AI agents. Automate tasks online with ease. 62,000 stars.
-{"pick": 1, "headline": "Browser Use lets AI agents work websites for you", "dek": "The library automates online tasks for agents and has 62,000 stars on GitHub."}
+{"pick": 1, "headline": "Browser Use lets AI click through websites for you", "dek": "The tool handles online chores, and 62,000 developers have bookmarked it on GitHub."}
 
 1. Source: arXiv
 Title: Scaling Laws for Neural Language Models
 Details: We study empirical scaling laws for language model performance on the cross-entropy loss. The loss scales as a power-law with model size, dataset size, and the amount of compute used for training.
-{"pick": 1, "headline": "Researchers find language models improve predictably with scale", "dek": "Loss falls as a power law as model size, data and training compute grow."}
+{"pick": 1, "headline": "Researchers find AI models improve predictably as they grow", "dek": "Adding size, data or computing power cuts errors along a smooth, predictable curve."}
 
 Today's top "${label}" items:
 
@@ -634,8 +635,12 @@ Reply with the JSON only.`;
 
 // Filler small models reach for when there is nothing concrete to say
 const FILLER = /\b(simplif\w*|impact\w*|chang\w* (how|the way)|revolution\w*|game.?chang\w*|streamlin\w*|empower\w*|enabl\w*|seamless\w*|leverag\w*|cutting.edge|groundbreaking|pav\w* the way|landscape)\b/i;
+// Tech words a reader outside tech won't know — a story using them gets rewritten
+const JARGON = /\b(tokens?|latency|p\d\d|harness(es)?|benchmarks?|sdks?|apis?|open.weights?|inference|parameters?|llms?|fine.tun\w*|multimodal|quantiz\w*|embeddings?|rag|transformers?|gateway|context window|calibrated|probabilit\w*|model.independent|programmatic|runtime|endpoints?|throughput|checkpoints?|repos?|\d+(\.\d+)?[BMK])\b/;
 // Capitalised words that are not names, so they need no backing in the item
 const PLAIN = new Set(("the a an it its this these that their his her our your you new how why what who when after with for in on as at by " +
+  "anyone everyone someone more most some many free fake firm firms group tool tools app apps model models add-on " +
+  "coders programmers attackers scammers officials lawmakers regulators companies " +
   "researchers researcher developers developer engineers engineer scientists users teams people hackers security " +
   "startup startups company lab study paper report authors experts investors " +
   "ai llm llms api apis gpu gpus cpu ml open one two three four five six seven eight nine ten").split(" "));
@@ -673,14 +678,18 @@ function storyProblems({ headline, dek }, f) {
   const content = words(headline).map(w => bare(w).toLowerCase()).filter(w => w.length > 2 && !PLAIN.has(w));
   const title = f.title.toLowerCase();
   if(content.length >= 3 && content.filter(w => title.includes(w)).length / content.length >= 0.75)
-    soft.push(`the headline repeats the item's title; say in your own words what it does or what is new, like "Mistral's Codestral writes code in more than 80 languages"`);
+    soft.push(`the headline repeats the item's title; say in plain words what it does or what is new, like "Mistral's Codestral writes code in more than 80 programming languages"`);
   const filler = `${headline} ${dek}`.match(FILLER);
   if(filler) soft.push(`"${filler[0]}" is filler`);
+  const jargon = `${headline} ${dek}`.match(new RegExp(JARGON, "i"));
+  if(jargon) soft.push(`"${jargon[0]}" is tech jargon; say it in everyday words or leave it out`);
   // Names and numbers must come from the item
   const known = itemText(f);
-  const knownNums = known.replace(/(\d),(?=\d)/g, "$1");
-  for(const n of `${headline} ${dek}`.replace(/(\d),(?=\d)/g, "$1").match(/\d+(?:\.\d+)?/g) || [])
-    if(!knownNums.includes(n)) hard.push(`${n} is not in the item`);
+  // A rounded number from the item is fine ("under $5" for $4.73); a new one is not
+  const nums = t => (t.replace(/(\d),(?=\d)/g, "$1").match(/\d+(?:\.\d+)?/g) || []).map(Number);
+  const knownNums = nums(known);
+  for(const n of nums(`${headline} ${dek}`))
+    if(!knownNums.some(m => Math.abs(n - m) <= Math.max(0.1 * m, 0.5))) hard.push(`${n} is not in the item`);
   for(const w of words(titleCase ? dek : `${headline} ${dek}`)) {
     const name = bare(w);
     if(!/[A-Z]/.test(name) || PLAIN.has(name.toLowerCase()) || known.includes(name.toLowerCase())) continue;
