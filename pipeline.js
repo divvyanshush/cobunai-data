@@ -576,7 +576,7 @@ const STORY_PROMPT = (label, facts) => `You are the editor of CobunAI, a daily n
 
 Choose the ONE item that is the biggest news for these readers: a launch, release, deal or result beats an essay or an opinion piece. Reply with JSON: {"pick": <item number>, "headline": "...", "dek": "..."}
 
-headline: who did what, in at most 10 words. Start with who (the company, lab, person or project; "Researchers" for a paper), then an active verb. Say what is new about it or what it does differently, not just that it was released or launched. Plain words. No colons, no "owner/repo" names, no title copied word for word.
+headline: who did what, in at most 10 words, in sentence case. Start with who (the company, lab, person or project; "Researchers" for a paper), then an active verb. Say what is new about it or what it does differently, not just that it was released or launched. Plain words. No colons, no "owner/repo" names, no title copied word for word.
 dek: one complete sentence of at most 20 words that adds the most concrete fact the headline left out: a number, a name, or what exactly changed. Write it like a newspaper, with "a" and "the" where they belong. Never start it with "It" or "This". No filler such as "simplifying", "enabling", "impacting" or "changing how developers work".
 Use only facts written in the item, and spell names exactly as the item does. Never add numbers, names or claims that are not there.
 
@@ -612,7 +612,13 @@ const PLAIN = new Set(("the a an it its this these that their his her our your y
   "ai llm llms api apis gpu gpus cpu ml open one two three four five six seven eight nine ten").split(" "));
 const words = s => s.split(/\s+/).filter(Boolean);
 const bare = w => w.replace(/^[^\w$]+|[^\w]+$/g, "").replace(/['’]s$/, "");
-const itemText = f => `${f.source} ${f.title} ${f.details}`.toLowerCase();
+// Makers everyone knows from the product name, so "Anthropic's Claude Code" needs no "Anthropic" in the item
+const MAKERS = [[/\bclaude\b/, "anthropic"], [/\b(chatgpt|gpt-?\d|codex|sora)\b/, "openai"], [/\b(gemini|gemma|deepmind)\b/, "google"],
+  [/\bllama\b/, "meta"], [/\bgrok\b/, "xai"], [/\bcopilot\b/, "microsoft github"]];
+const itemText = f => {
+  const t = `${f.source} ${f.title} ${f.details}`.toLowerCase();
+  return t + MAKERS.filter(([re]) => re.test(t)).map(([, maker]) => ` ${maker}`).join("");
+};
 
 // How many of the story's distinctive words come from this item — tells which item it is about
 const overlap = ({ headline, dek }, f) => {
@@ -631,6 +637,10 @@ function storyProblems({ headline, dek }, f) {
   if(/:/.test(headline)) hard.push("the headline has a colon");
   if(/[A-Za-z][\w.-]*\/[A-Za-z][\w.-]+/.test(headline)) hard.push("the headline has an owner/repo name");
   if(/^(it|this|these)\b/i.test(dek)) soft.push(`the dek starts with "${words(dek)[0]}"`);
+  // In Title Case every word looks like a name, so only the dek's names get checked
+  const long = words(headline).filter(w => /^[a-z]/i.test(w) && bare(w).length > 3);
+  const titleCase = long.length >= 3 && long.filter(w => /^[A-Z]/.test(w)).length / long.length >= 0.7;
+  if(titleCase) soft.push("write the headline in sentence case: capitals only for the first word and names");
   // "Baseten releases joey-1, a 2B decision model" is the press title again, not news
   const content = words(headline).map(w => bare(w).toLowerCase()).filter(w => w.length > 2 && !PLAIN.has(w));
   const title = f.title.toLowerCase();
@@ -643,7 +653,7 @@ function storyProblems({ headline, dek }, f) {
   const knownNums = known.replace(/(\d),(?=\d)/g, "$1");
   for(const n of `${headline} ${dek}`.replace(/(\d),(?=\d)/g, "$1").match(/\d+(?:\.\d+)?/g) || [])
     if(!knownNums.includes(n)) hard.push(`${n} is not in the item`);
-  for(const w of words(`${headline} ${dek}`)) {
+  for(const w of words(titleCase ? dek : `${headline} ${dek}`)) {
     const name = bare(w);
     if(!/[A-Z]/.test(name) || PLAIN.has(name.toLowerCase()) || known.includes(name.toLowerCase())) continue;
     // "OpenAI-backed" is fine when "OpenAI" is in the item
