@@ -485,7 +485,13 @@ function makeChat({ url, key="", model }) {
 }
 
 // Bump when prompts change — build.js drops AI text written by another model or prompt version
-const PROMPT_VERSION = 3;
+const PROMPT_VERSION = 4;
+
+// Cut at a word boundary — a word chopped mid-way gets copied into the output by small models
+const clip = (text, n) => {
+  const t = (text||"").replace(/…$/, "").trim();
+  return t.length <= n ? t : t.slice(0, n).replace(/\s+\S*$/, "") + "…";
+};
 
 // Small models ramble and number things — keep at most `n` plain sentences
 const firstSentences = (text, n=2) => {
@@ -512,9 +518,9 @@ async function generateWhys(items, chat, cache) {
   for(const item of todo) {
     const prompt = `An item for developers building AI products:
 Title: ${item.title}
-Summary: ${(item.sum||"").slice(0,240)}
+Summary: ${clip(item.sum, 240)}
 
-In ONE sentence of at most 14 words, say what this lets them do or what it changes for them. Use only the information above; never invent numbers or names, and never restate the title. If it is spam, a listicle or irrelevant to them, reply with just: SKIP`;
+In ONE sentence of at most 14 words, say what this lets them do or what it changes for them. Use only the information above; never invent numbers or names, and never restate the title. Only if it is spam or a pure listicle, reply with just: SKIP`;
     try {
       const raw = await chat(prompt, { maxTokens:60, temperature:0.2 });
       const why = /^\W*skip\b/i.test(raw) ? "" : firstSentences(raw.replace(/^["']|["']$/g, ""), 1);
@@ -560,7 +566,7 @@ async function buildDigest(items, chat, prev=null) {
     let summary = prevCats.get(cat.id)?.key === key ? (prevCats.get(cat.id).summary || "") : "";
     if(!summary && chat) {
       const prompt = `Today's top "${cat.label}" items for AI developers:
-${topItems.map((i,idx) => `${idx+1}. ${i.title}${i.sum ? " — " + i.sum.slice(0,140) : ""}`).join("\n")}
+${topItems.map((i,idx) => `${idx+1}. ${i.title}${i.sum ? " — " + clip(i.sum, 140) : ""}`).join("\n")}
 
 Write a 2-sentence brief, each sentence under 25 words. Begin with the name of the single most important item above and say plainly what it is. The second sentence gives the practical upshot for someone building AI products, in your own words.
 Use only facts stated above — never add numbers, names or details that are not there. Plain prose: no lists, no labels, no hype words, no preamble.`;
@@ -582,9 +588,9 @@ Use only facts stated above — never add numbers, names or details that are not
   if(!intro && chat && top5.length) {
     try {
       intro = firstSentences(await chat(`Today's top AI stories for developers:
-${top5.map(i => `- ${i.title}${i.sum ? " — " + i.sum.slice(0,120) : ""}`).join("\n")}
+${top5.map(i => `- ${i.title}${i.sum ? " — " + clip(i.sum, 120) : ""}`).join("\n")}
 
-Pick the ONE story that matters most to developers building AI products and write 2 short sentences about it. Your first words are the story's name, followed by what happened; the second sentence says why it matters. Write like one developer talking to another. Use only facts stated above.`,
+Pick the ONE story that matters most to developers building AI products and write 2 short sentences about it, each under 25 words. Start with the story's short name and what happened, in your own words; the second sentence says why it matters. Write like one developer talking to another. Use only facts stated above.`,
         { maxTokens:140, temperature:0.5 }), 2);
     } catch(e) {
       console.warn("Intro generation failed:", e.message);
