@@ -1,19 +1,16 @@
 {
   "name": "pulse-backend",
   "version": "1.0.0",
-  "description": "CobunAI backend — aggregates and summarises AI sources",
+  "description": "CobunAI data — aggregates and summarises AI sources into static JSON",
   "main": "build.js",
   "scripts": {
-    "build": "node build.js",
-    "start": "node server.js"
+    "build": "node build.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "cors": "^2.8.6",
-    "express": "^5.2.1",
     "rss-parser": "^3.13.0"
   },
   "engines": {

@@ -1,5 +1,5 @@
 // CobunAI data pipeline — fetch, score, cluster and summarise AI sources.
-// Shared by build.js (static JSON for GitHub Pages) and server.js (legacy Render API).
+// Used by build.js, which publishes the result as static JSON on GitHub Pages.
 import Parser from "rss-parser";
 import crypto from "crypto";
 
@@ -175,7 +175,7 @@ async function fetchHN() {
     return true;
   });
 
-  // Batches of 30 — firing ~300 requests at once times out on a small Render instance
+  // Batches of 30 — firing ~300 requests at once times out on small machines
   const rows = [];
   for(let i = 0; i < allIds.length; i += 30) {
     rows.push(...await Promise.allSettled(allIds.slice(i, i+30).map(id =>
@@ -463,7 +463,7 @@ async function fetchAll() {
 }
 
 // ── LLM ───────────────────────────────────────────────────────────
-// Any OpenAI-compatible chat endpoint: a local Ollama in GitHub Actions, or Groq on Render.
+// Any OpenAI-compatible chat endpoint — in GitHub Actions, a local Ollama.
 function makeChat({ url, key="", model }) {
   return async (prompt, { maxTokens=200, temperature=0.3, timeout=180000, json=false }={}) => {
     const res = await fetch(`${url}/chat/completions`, {
