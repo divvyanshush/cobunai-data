@@ -1,7 +1,7 @@
 // Builds the static data cobunai.com reads from GitHub Pages: feed.json, digest.json, status.json.
 // Runs hourly in GitHub Actions (.github/workflows/build.yml). Locally: `npm run build`.
 import fs from "fs";
-import { fetchAll, makeChat, generateWhys, buildDigest } from "./pipeline.js";
+import { fetchAll, makeChat, generateWhys, buildDigest, PROMPT_VERSION } from "./pipeline.js";
 
 const OUT  = process.env.OUT_DIR || "public";
 const PREV = process.env.PREV_URL; // the published site — reuse AI text that is still current
@@ -18,7 +18,10 @@ async function loadPrev(name) {
 }
 
 const started = Date.now();
+const aiVersion = chat ? `${process.env.LLM_MODEL}/v${PROMPT_VERSION}` : null;
 const [prevFeed, prevDigest] = await Promise.all([loadPrev("feed.json"), loadPrev("digest.json")]);
+// AI text from a different model or prompt version gets rewritten
+const prevAI = prevFeed?.aiVersion === aiVersion;
 const { items:fresh, failed } = await fetchAll();
 
 // A source that failed this hour keeps its last items (up to a week old) instead of vanishing
@@ -33,10 +36,10 @@ if(items.length < 50) {
   process.exit(1);
 }
 
-const whyCache = new Map((prevFeed?.items||[]).filter(i => i.why).map(i => [i.id, i.why]));
+const whyCache = new Map(prevAI ? (prevFeed?.items||[]).filter(i => i.why).map(i => [i.id, i.why]) : []);
 if(chat) await generateWhys(items, chat, whyCache);
 const feedItems = items.map(i => ({ ...i, why:whyCache.get(i.id) || "" }));
-const digest = await buildDigest(feedItems, chat, prevDigest);
+const digest = await buildDigest(feedItems, chat, prevAI ? prevDigest : null);
 
 const generatedAt = new Date().toISOString();
 const sources = {};
@@ -44,11 +47,11 @@ for(const i of feedItems) sources[i.src] = (sources[i.src]||0) + 1;
 
 fs.mkdirSync(OUT, { recursive:true });
 const write = (name, data) => fs.writeFileSync(`${OUT}/${name}`, JSON.stringify(data));
-write("feed.json", { items:feedItems, generatedAt });
-write("digest.json", { ...digest, generatedAt });
+write("feed.json", { items:feedItems, generatedAt, aiVersion });
+write("digest.json", { ...digest, generatedAt, aiVersion });
 write("status.json", {
   generatedAt, items:feedItems.length, sources, failed,
-  model: chat ? process.env.LLM_MODEL : null,
+  model: aiVersion,
   withWhy: feedItems.filter(i => i.why).length,
   summaries: digest.categories.filter(c => c.summary).length + "/" + digest.categories.length,
   seconds: Math.round((Date.now()-started)/1000),

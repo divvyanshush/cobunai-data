@@ -329,9 +329,7 @@ const RSS_SOURCES = [
   { url:"https://towardsdatascience.com/feed",            src:"TDS",         label:"Towards Data Science", aiOnly:true },
   { url:"https://www.marktechpost.com/feed/",             src:"MarkTechPost", label:"MarkTechPost",   aiOnly:true },
   { url:"https://bdtechtalks.com/feed/",                  src:"TechTalks",   label:"BD Tech Talks",   aiOnly:true },
-  { url:"https://thesequence.substack.com/feed",          src:"TheSequence", label:"The Sequence",    aiOnly:true },
   { url:"https://lastweekin.ai/feed",                     src:"LastWeekInAI",label:"Last Week in AI", aiOnly:true },
-  { url:"https://importai.substack.com/feed",             src:"ImportAI",    label:"Import AI",       aiOnly:true },
   { url:"https://www.together.ai/blog/rss.xml", src:"TogetherAI", label:"Together AI", aiOnly:true },
   { url:"https://magazine.sebastianraschka.com/feed", src:"Raschka", label:"Sebastian Raschka", aiOnly:true },
   { url:"https://lilianweng.github.io/index.xml", src:"LilianWeng", label:"Lilian Weng", aiOnly:true },
@@ -486,11 +484,15 @@ function makeChat({ url, key="", model }) {
   };
 }
 
+// Bump when prompts change — build.js drops AI text written by another model or prompt version
+const PROMPT_VERSION = 2;
+
 // Small models ramble and number things — keep at most `n` plain sentences
 const firstSentences = (text, n=2) => {
   const flat = (text||"")
     .replace(/(^|\s)(\d{1,2}[.)]|[-*•])(?=\s)/g, " ") // list markers, inline or at line start
     .replace(/\*\*|__|`/g, "")
+    .replace(/\b(first|second|sentence)( sentence)?\s*\d*\s*:\s*/gi, "")
     .replace(/\s+/g, " ").trim();
   // Split only where a sentence end is followed by a new capitalised sentence, so "Qwen2.5" survives
   return flat.split(/(?<=[.!?])\s+(?=["“'(\[]?[A-Z0-9])/).slice(0, n).join(" ").trim();
@@ -508,7 +510,7 @@ async function generateWhys(items, chat, cache) {
   // Batches of 10 keep small local models on track
   for(let b = 0; b < todo.length; b += 10) {
     const batch = todo.slice(b, b+10);
-    const prompt = `You help AI developers decide what to read. For each item below, write ONE sentence (max 14 words) on why it matters to someone building AI products: cost, speed, capability or workflow. Use only the information given; never invent numbers or names. Never restate the title. Use an empty string for spam, listicles or off-topic items.
+    const prompt = `You help AI developers decide what to read. For each item below, write ONE sentence (max 14 words) on what it lets someone building AI products do, or what it changes for them — specific to that item, not a general truth about AI. Use only the information given; never invent numbers or names. Never restate the title. Use an empty string for spam, listicles or off-topic items.
 Return ONLY a JSON object mapping each id to its sentence, like {"id1":"...","id2":""}.
 
 Items:
@@ -570,8 +572,8 @@ async function buildDigest(items, chat, prev=null) {
       const prompt = `Today's top "${cat.label}" items for AI developers:
 ${topItems.map((i,idx) => `${idx+1}. ${i.title}${i.sum ? " — " + i.sum.slice(0,140) : ""}`).join("\n")}
 
-Write exactly 2 short sentences. Sentence 1: name the single most important item above and say plainly what it is. Sentence 2: say who should try it or read it, and why.
-Use only facts stated above — never add numbers, names or details that are not there. No lists, no hype words, no preamble.`;
+Write a 2-sentence brief. Begin with the name of the single most important item above and say plainly what it is. Then say why it matters to developers building AI products.
+Use only facts stated above — never add numbers, names or details that are not there. Plain prose: no lists, no labels, no hype words, no preamble.`;
       try {
         summary = firstSentences(await chat(prompt, { maxTokens:160 }), 2);
       } catch(e) {
@@ -592,7 +594,7 @@ Use only facts stated above — never add numbers, names or details that are not
       intro = firstSentences(await chat(`Today's top AI stories for developers:
 ${top5.map(i => `- ${i.title}${i.sum ? " — " + i.sum.slice(0,120) : ""}`).join("\n")}
 
-Pick the ONE story that matters most to developers building AI products. In 2 short sentences, say what it is and why it matters. Write like one developer talking to another. Use only facts stated above. No preamble, no sign-off.`,
+Pick the ONE story that matters most to developers building AI products and write 2 short sentences about it. Your first words are the story's name, followed by what happened; the second sentence says why it matters. Write like one developer talking to another. Use only facts stated above.`,
         { maxTokens:140, temperature:0.5 }), 2);
     } catch(e) {
       console.warn("Intro generation failed:", e.message);
@@ -602,5 +604,5 @@ Pick the ONE story that matters most to developers building AI products. In 2 sh
   return { intro, introKey, categories, generatedAt:new Date().toISOString() };
 }
 
-export { fetchAll, makeChat, generateWhys, buildDigest, firstSentences, RSS_SOURCES };
+export { fetchAll, makeChat, generateWhys, buildDigest, firstSentences, RSS_SOURCES, PROMPT_VERSION };
 

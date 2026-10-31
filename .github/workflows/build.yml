@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  LLM_MODEL: qwen2.5:3b
+  LLM_MODEL: qwen2.5:7b
 
 jobs:
   build:
