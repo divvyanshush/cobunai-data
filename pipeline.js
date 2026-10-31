@@ -41,7 +41,7 @@ const guessType = (t, body="", src="") => {
   if(src==="arXiv") return "research";
 
   // Funding — very specific signals only
-  if (/series [abcde] |seed round|funding round|\$\d+[mb] raise|acqui[a-z]+ |merger|ipo/.test(s)) return "funding";
+  if (/series [abcde] |seed round|funding round|\$\d+[mb] raise|acqui[a-z]+ |merger|\bipo\b/.test(s)) return "funding";
 
   // Model — specific model names anywhere in title
   if (/\bgpt-[\d.]|claude [\d]|claude opus|claude sonnet|claude haiku|gemini [\d.]|llama [\d]|llama-[\d]|mistral [\d]|deepseek-|deepseek [\d]|qwen[\d]|phi-[\d]|grok-[\d]|gpt-4|gpt-5|o1 |o3 |o1-|o3-/.test(title)) return "model";
@@ -485,7 +485,7 @@ function makeChat({ url, key="", model }) {
 }
 
 // Bump when prompts change — build.js drops AI text written by another model or prompt version
-const PROMPT_VERSION = 2;
+const PROMPT_VERSION = 3;
 
 // Small models ramble and number things — keep at most `n` plain sentences
 const firstSentences = (text, n=2) => {
@@ -499,7 +499,8 @@ const firstSentences = (text, n=2) => {
 };
 
 // ── "Why this matters" lines ──────────────────────────────────────
-// Fills `cache` (id → sentence) for the hottest items that don't have one yet.
+// Fills `cache` (id → sentence, "" = checked and not worth a line) for the hottest unchecked items.
+// One item per call: in batches, models attach lines to the wrong item.
 async function generateWhys(items, chat, cache) {
   const todo = [...items]
     .sort((a,b)=>(b.heat||0)-(a.heat||0))
@@ -507,34 +508,23 @@ async function generateWhys(items, chat, cache) {
     .slice(0,30)
     .filter(i => !cache.has(i.id));
 
-  // Batches of 10 keep small local models on track
-  for(let b = 0; b < todo.length; b += 10) {
-    const batch = todo.slice(b, b+10);
-    const prompt = `You help AI developers decide what to read. For each item below, write ONE sentence (max 14 words) on what it lets someone building AI products do, or what it changes for them — specific to that item, not a general truth about AI. Use only the information given; never invent numbers or names. Never restate the title. Use an empty string for spam, listicles or off-topic items.
-Return ONLY a JSON object mapping each id to its sentence, like {"id1":"...","id2":""}.
+  let written = 0;
+  for(const item of todo) {
+    const prompt = `An item for developers building AI products:
+Title: ${item.title}
+Summary: ${(item.sum||"").slice(0,240)}
 
-Items:
-${batch.map(i=>`{"id":"${i.id}","title":${JSON.stringify(i.title)},"sum":${JSON.stringify((i.sum||"").slice(0,160))}}`).join("\n")}`;
+In ONE sentence of at most 14 words, say what this lets them do or what it changes for them. Use only the information above; never invent numbers or names, and never restate the title. If it is spam, a listicle or irrelevant to them, reply with just: SKIP`;
     try {
-      const raw = (await chat(prompt, { maxTokens:700, temperature:0.2, json:true })) || "{}";
-      const clean = raw.replace(/```json|```/g,"").trim();
-      let whys = {};
-      try {
-        const match = clean.match(/\{[\s\S]*\}/);
-        if(match) whys = JSON.parse(match[0]);
-      } catch(e2) {
-        for(const line of clean.split("\n")) {
-          const m = line.match(/"([^"]+)"\s*:\s*"([^"]*)"/);
-          if(m) whys[m[1]] = m[2];
-        }
-      }
-      const ids = new Set(batch.map(i => i.id));
-      Object.entries(whys).forEach(([id,why])=>{ if(ids.has(id) && typeof why==="string" && why.trim()) cache.set(id, firstSentences(why, 1)); });
-      console.log(`Generated ${Object.keys(whys).length} why-this-matters (batch ${b/10+1})`);
+      const raw = await chat(prompt, { maxTokens:60, temperature:0.2 });
+      const why = /^\W*skip\b/i.test(raw) ? "" : firstSentences(raw.replace(/^["']|["']$/g, ""), 1);
+      cache.set(item.id, why);
+      if(why) written++;
     } catch(e) {
-      console.warn("Why generation failed:", e.message);
+      console.warn(`Why failed (${item.id}):`, e.message); // left unchecked — retried next run
     }
   }
+  if(todo.length) console.log(`Generated ${written} why-this-matters lines for ${todo.length} items`);
 }
 
 // ── Daily digest — category summaries + intro ─────────────────────
@@ -572,7 +562,7 @@ async function buildDigest(items, chat, prev=null) {
       const prompt = `Today's top "${cat.label}" items for AI developers:
 ${topItems.map((i,idx) => `${idx+1}. ${i.title}${i.sum ? " — " + i.sum.slice(0,140) : ""}`).join("\n")}
 
-Write a 2-sentence brief. Begin with the name of the single most important item above and say plainly what it is. Then say why it matters to developers building AI products.
+Write a 2-sentence brief, each sentence under 25 words. Begin with the name of the single most important item above and say plainly what it is. The second sentence gives the practical upshot for someone building AI products, in your own words.
 Use only facts stated above — never add numbers, names or details that are not there. Plain prose: no lists, no labels, no hype words, no preamble.`;
       try {
         summary = firstSentences(await chat(prompt, { maxTokens:160 }), 2);

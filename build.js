@@ -36,7 +36,11 @@ if(items.length < 50) {
   process.exit(1);
 }
 
-const whyCache = new Map(prevAI ? (prevFeed?.items||[]).filter(i => i.why).map(i => [i.id, i.why]) : []);
+const whyCache = new Map();
+if(prevAI) {
+  for(const id of prevFeed.whyChecked || []) whyCache.set(id, ""); // checked, nothing worth a line
+  for(const i of prevFeed.items || []) if(i.why) whyCache.set(i.id, i.why);
+}
 if(chat) await generateWhys(items, chat, whyCache);
 const feedItems = items.map(i => ({ ...i, why:whyCache.get(i.id) || "" }));
 const digest = await buildDigest(feedItems, chat, prevAI ? prevDigest : null);
@@ -47,7 +51,8 @@ for(const i of feedItems) sources[i.src] = (sources[i.src]||0) + 1;
 
 fs.mkdirSync(OUT, { recursive:true });
 const write = (name, data) => fs.writeFileSync(`${OUT}/${name}`, JSON.stringify(data));
-write("feed.json", { items:feedItems, generatedAt, aiVersion });
+const whyChecked = feedItems.filter(i => whyCache.get(i.id) === "").map(i => i.id);
+write("feed.json", { items:feedItems, generatedAt, aiVersion, whyChecked });
 write("digest.json", { ...digest, generatedAt, aiVersion });
 write("status.json", {
   generatedAt, items:feedItems.length, sources, failed,
