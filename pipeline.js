@@ -663,6 +663,20 @@ function storyProblems({ headline, dek }, f) {
   return { hard, soft };
 }
 
+// "Phorion Discovers Backdoor in Claude Code" → "Phorion discovers backdoor in Claude Code": a word keeps its
+// capital only as the first word, an acronym or CamelCase name, or where the item itself capitalises it
+function sentenceCase(headline, f) {
+  const plainTitle = words(f.title).some(w => /^[a-z]{4,}$/.test(bare(w))); // a Title Case title proves nothing
+  const evidence = `${f.details} ${plainTitle ? words(f.title).slice(1).join(" ") : ""}`;
+  const text = `${f.source} ${f.title} ${f.details}`.toLowerCase();
+  const makers = new Set(MAKERS.filter(([re]) => re.test(text)).flatMap(([, maker]) => maker.split(" ")));
+  return words(headline).map((w, wi) => w.split("-").map((part, pi) => {
+    const name = bare(part);
+    if((wi === 0 && pi === 0) || !/^[A-Z][a-z]+$/.test(name) || evidence.includes(name) || makers.has(name.toLowerCase())) return part;
+    return part.replace(name, name.toLowerCase());
+  }).join("-")).join(" ");
+}
+
 const parseStory = raw => {
   try { return JSON.parse(raw.match(/\{[\s\S]*\}/)?.[0] || raw); } catch { return null; }
 };
@@ -671,7 +685,7 @@ const parseStory = raw => {
 async function writeStory(cat, topItems, chat) {
   const facts = topItems.map(storyFacts);
   let best = null, feedback = "";
-  for(const temperature of [0.2, 0.5, 0.7]) {
+  for(const temperature of [0.2, 0.6, 0.8, 0.8]) {
     const raw = await chat(STORY_PROMPT(cat.label, facts) + feedback, { maxTokens:160, temperature, json:true });
     const s = parseStory(raw) || {};
     const story = {
@@ -694,9 +708,12 @@ async function writeStory(cat, topItems, chat) {
     if(!best || draft.hard.length < best.hard.length || (draft.hard.length === best.hard.length && draft.soft.length < best.soft.length)) best = draft;
     if(!draft.hard.length && !draft.soft.length) break;
     console.warn(`Digest ${cat.id} draft rejected: "${story.headline}" / "${story.dek}" — ${[...p.hard, ...p.soft].join("; ")}`);
-    feedback = `\n\nYour last draft was ${JSON.stringify({ pick:pick+1, ...story })}. It broke these rules: ${[...p.hard, ...p.soft].join("; ")}. Write a better one.`;
+    // Name the broken rules but don't quote the draft: shown its last draft, the model rewrites it word for word
+    feedback = `\n\nA first draft broke these rules: ${[...p.hard, ...p.soft].join("; ")}. Write a new one that keeps every rule.`;
   }
-  return best.hard.length ? null : { headline:best.headline, dek:best.dek, lead:best.lead };
+  if(best.hard.length) return null;
+  const lead = topItems.find(i => i.id === best.lead);
+  return { headline:sentenceCase(best.headline, storyFacts(lead)), dek:best.dek, lead:best.lead };
 }
 
 // `prev` is the last digest: a category whose top items haven't changed keeps its story.
