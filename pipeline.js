@@ -153,6 +153,8 @@ const heatScore = (score, comments, src, time, title="", sum="") => {
 };
 
 const safeText = t => (t||"").replace(/<[^>]+>/g,"").replace(/\s+/g," ").trim();
+// Longer text than `sum`, for the digest prompt only — build.js leaves it out of feed.json
+const BODY = 700;
 
 // ── FETCHERS ──────────────────────────────────────────────────────
 
@@ -187,6 +189,7 @@ async function fetchHN() {
     .map(({value:s}) => ({
       id:`hn-${s.id}`, src:"HN", type:"discuss", tags:guessTags(s.title), title:s.title,
       sum: s.text ? safeText(s.text).slice(0,220)+"…" : "Discussion on Hacker News.",
+      body: s.text ? safeText(s.text).slice(0,BODY) : "",
       link: s.url||`https://news.ycombinator.com/item?id=${s.id}`,
       time:s.time, score:s.score||0, comments:s.descendants||0,
     }));
@@ -214,12 +217,13 @@ async function fetchArxiv() {
   return entries.map(e => {
     const get = tag => { const m=e.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`)); return m?m[1].trim():""; };
     const title   = get("title").replace(/\n/g," ").trim();
-    const summary = safeText(get("summary")).slice(0,240)+"…";
+    const abstract = safeText(get("summary"));
+    const summary = abstract.slice(0,240)+"…";
     const link    = (e.match(/<id>([\s\S]*?)<\/id>/)||[])[1]?.trim()||"https://arxiv.org";
     const pub     = (e.match(/<published>([\s\S]*?)<\/published>/)||[])[1]?.trim();
     const time    = pub ? Math.floor(new Date(pub).getTime()/1000) : Math.floor(Date.now()/1000);
     const authors = (e.match(/<name>([\s\S]*?)<\/name>/g)||[]).slice(0,3).map(a=>a.replace(/<\/?name>/g,"")).join(", ");
-    return { id:`arxiv-${link.split("/abs/")[1]||Math.random()}`, src:"arXiv", type:"research", tags:guessTags(title, summary), title, sum:summary, link, time, score:0, comments:0, authors };
+    return { id:`arxiv-${link.split("/abs/")[1]||Math.random()}`, src:"arXiv", type:"research", tags:guessTags(title, summary), title, sum:summary, body:abstract.slice(0,BODY), link, time, score:0, comments:0, authors };
   }).filter(e=>e.title);
 }
 
@@ -304,12 +308,13 @@ async function fetchRSS(url, src, srcLabel, aiOnly=false, customHeaders={}) {
   // Some feeds (OpenAI, HuggingFace) list hundreds of posts in no particular order
   return [...(feed.items||[])].sort((a,b) => pubTime(b) - pubTime(a)).slice(0, 20)
     .filter(e => aiOnly || isAI(e.title||""))
-    .map(e=>({
+    .map(e=>({ e, text:safeText(e.contentSnippet||e.summary||e.content||"") }))
+    .map(({ e, text })=>({
       // Hash the whole link — a short prefix is identical for every post on a site
       id:`${src.toLowerCase().replace(/\s/g,"-")}-${crypto.createHash("sha1").update(e.link||e.title||"").digest("hex").slice(0,16)}`,
-      src, srcLabel:srcLabel||src, type:guessType(e.title||"", e.contentSnippet||e.summary||""), tags:guessTags(e.title||"", e.contentSnippet||e.summary||""),
+      src, srcLabel:srcLabel||src, type:guessType(e.title||"", e.contentSnippet||e.summary||"", src), tags:guessTags(e.title||"", e.contentSnippet||e.summary||""),
       title:(e.title||"").replace(/\n/g," ").trim(),
-      sum:safeText(e.contentSnippet||e.summary||e.content||"").slice(0,240)+"…",
+      sum:text.slice(0,240)+"…", body:text.slice(0,BODY),
       link:e.link||"", time:e.pubDate?Math.floor(new Date(e.pubDate).getTime()/1000):Math.floor(Date.now()/1000),
       score:0, comments:0, authors:e.creator||e.author||"",
     }));
@@ -485,7 +490,7 @@ function makeChat({ url, key="", model }) {
 }
 
 // Bump when prompts change — build.js drops AI text written by another model or prompt version
-const PROMPT_VERSION = 7;
+const PROMPT_VERSION = 8;
 
 // Cut at a word boundary — a word chopped mid-way gets copied into the output by small models
 const clip = (text, n) => {
@@ -550,11 +555,33 @@ const unescape = s => (s||"")
   .replace(/&#(\d+);/g, (_,d) => String.fromCodePoint(+d))
   .replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&amp;/g,"&");
 
+// Hacker News and Lobsters threads arrive as a bare title. For the hottest ones, read the linked page's own
+// description so the digest has a fact to work with. Fills `body`; a page that fails leaves the item as it was.
+async function addLinkText(items, n=12) {
+  const threads = items
+    // A thread's own text that is only a link (or a few words) says nothing either
+    .filter(i => (i.src==="HN" || i.src==="Lobste.rs") && !/\s\S+\s\S+\s\S+\s/.test(unescape(i.body||"")))
+    .filter(i => /^https?:/.test(i.link||"") && !/ycombinator\.com|lobste\.rs/.test(i.link))
+    .sort((a,b) => (b.heat||0) - (a.heat||0)).slice(0, n);
+  const meta = (html, name) => html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${name}["'][^>]*>`, "i"))?.[0]
+    .match(/content=(["'])([\s\S]*?)\1/i)?.[2];
+  const results = await Promise.allSettled(threads.map(async i => {
+    const res = await fetch(i.link, { headers:{ "User-Agent":FEED_HEADERS["User-Agent"], "Accept":"text/html" }, signal:AbortSignal.timeout(8000) });
+    if(!res.ok || !/html/.test(res.headers.get("content-type")||"")) return false;
+    const html = (await res.text()).slice(0, 300000);
+    const text = safeText(unescape(meta(html, "og:description") || meta(html, "description") || meta(html, "twitter:description") || ""));
+    if(text.length < 40) return false;
+    i.body = text.slice(0, BODY);
+    return true;
+  }));
+  console.log(`Read ${results.filter(r => r.value === true).length}/${threads.length} linked pages for thread details`);
+}
+
 // What the model gets to know about one item — and all it may state
 function storyFacts(i) {
   const source = i.srcLabel || SRC_NAME[i.src] || i.src;
   // Feeds append "The post … appeared first on …" — noise that ends up in the story
-  let title = unescape(i.title), details = clip(unescape(i.sum).replace(/\s*The post\b.*$/, ""), 220);
+  let title = unescape(i.title), details = clip(unescape(i.body || i.sum).replace(/\s*The post\b.*$/, ""), 420);
   if(i.src === "GitHub") {
     // A bare owner/repo slug gets copied into headlines — spell it out instead
     const [owner, name] = title.split("/");
@@ -784,5 +811,5 @@ Pick the ONE story that matters most to developers building AI products and writ
   return { intro, introKey, categories, generatedAt:new Date().toISOString() };
 }
 
-export { fetchAll, makeChat, generateWhys, buildDigest, firstSentences, RSS_SOURCES, PROMPT_VERSION };
+export { fetchAll, makeChat, generateWhys, addLinkText, buildDigest, firstSentences, RSS_SOURCES, PROMPT_VERSION };
 

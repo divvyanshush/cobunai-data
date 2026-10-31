@@ -1,7 +1,7 @@
 // Builds the static data cobunai.com reads from GitHub Pages: feed.json, digest.json, status.json.
 // Runs hourly in GitHub Actions (.github/workflows/build.yml). Locally: `npm run build`.
 import fs from "fs";
-import { fetchAll, makeChat, generateWhys, buildDigest, PROMPT_VERSION } from "./pipeline.js";
+import { fetchAll, makeChat, generateWhys, addLinkText, buildDigest, PROMPT_VERSION } from "./pipeline.js";
 
 const OUT  = process.env.OUT_DIR || "public";
 const PREV = process.env.PREV_URL; // the published site — reuse AI text that is still current
@@ -43,6 +43,7 @@ if(prevAI) {
 }
 if(chat) await generateWhys(items, chat, whyCache);
 const feedItems = items.map(i => ({ ...i, why:whyCache.get(i.id) || "" }));
+if(chat) await addLinkText(feedItems);
 const digest = await buildDigest(feedItems, chat, prevAI ? prevDigest : null);
 
 const generatedAt = new Date().toISOString();
@@ -52,7 +53,8 @@ for(const i of feedItems) sources[i.src] = (sources[i.src]||0) + 1;
 fs.mkdirSync(OUT, { recursive:true });
 const write = (name, data) => fs.writeFileSync(`${OUT}/${name}`, JSON.stringify(data));
 const whyChecked = feedItems.filter(i => whyCache.get(i.id) === "").map(i => i.id);
-write("feed.json", { items:feedItems, generatedAt, aiVersion, whyChecked });
+// `body` is longer source text for the digest prompt only — the site never shows it
+write("feed.json", { items:feedItems.map(({ body, ...i }) => i), generatedAt, aiVersion, whyChecked });
 write("digest.json", { ...digest, generatedAt, aiVersion });
 write("status.json", {
   generatedAt, items:feedItems.length, sources, failed,
