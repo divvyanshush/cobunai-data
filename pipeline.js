@@ -637,10 +637,9 @@ function storyProblems({ headline, dek }, f) {
   if(/:/.test(headline)) hard.push("the headline has a colon");
   if(/[A-Za-z][\w.-]*\/[A-Za-z][\w.-]+/.test(headline)) hard.push("the headline has an owner/repo name");
   if(/^(it|this|these)\b/i.test(dek)) soft.push(`the dek starts with "${words(dek)[0]}"`);
-  // In Title Case every word looks like a name, so only the dek's names get checked
+  // In Title Case every word looks like a name, so only the dek's names get checked (sentenceCase fixes the rest)
   const long = words(headline).filter(w => /^[a-z]/i.test(w) && bare(w).length > 3);
   const titleCase = long.length >= 3 && long.filter(w => /^[A-Z]/.test(w)).length / long.length >= 0.7;
-  if(titleCase) soft.push("write the headline in sentence case: capitals only for the first word and names");
   // "Baseten releases joey-1, a 2B decision model" is the press title again, not news
   const content = words(headline).map(w => bare(w).toLowerCase()).filter(w => w.length > 2 && !PLAIN.has(w));
   const title = f.title.toLowerCase();
@@ -667,7 +666,9 @@ function storyProblems({ headline, dek }, f) {
 // capital only as the first word, an acronym or CamelCase name, or where the item itself capitalises it
 function sentenceCase(headline, f) {
   const plainTitle = words(f.title).some(w => /^[a-z]{4,}$/.test(bare(w))); // a Title Case title proves nothing
-  const evidence = `${f.details} ${plainTitle ? words(f.title).slice(1).join(" ") : ""}`;
+  // A repo slug like cherry-studio is the name "Cherry Studio"
+  const slug = (f.title.match(/^GitHub repo (\S+)/)?.[1] || "").split(/[-_.]/).map(p => p.charAt(0).toUpperCase() + p.slice(1));
+  const evidence = `${f.details} ${plainTitle ? words(f.title).slice(1).join(" ") : ""} ${slug.join(" ")}`;
   const text = `${f.source} ${f.title} ${f.details}`.toLowerCase();
   const makers = new Set(MAKERS.filter(([re]) => re.test(text)).flatMap(([, maker]) => maker.split(" ")));
   return words(headline).map((w, wi) => w.split("-").map((part, pi) => {
@@ -701,8 +702,11 @@ async function writeStory(cat, topItems, chat) {
     if(scores[likeliest] > scores[pick] + 1) pick = likeliest;
     let p = storyProblems(story, facts[pick]);
     if(p.hard.length) {
-      const other = facts.findIndex(f => !storyProblems(story, f).hard.length);
-      if(other >= 0) { pick = other; p = storyProblems(story, facts[pick]); }
+      // Another item the story shares words with may back it fully
+      const other = facts.map((f, idx) => idx)
+        .filter(idx => scores[idx] > 0 && scores[idx] >= scores[pick] && !storyProblems(story, facts[idx]).hard.length)
+        .sort((a, b) => scores[b] - scores[a])[0];
+      if(other !== undefined) { pick = other; p = storyProblems(story, facts[pick]); }
     }
     const draft = { ...story, lead:topItems[pick].id, hard:p.hard, soft:p.soft };
     if(!best || draft.hard.length < best.hard.length || (draft.hard.length === best.hard.length && draft.soft.length < best.soft.length)) best = draft;
@@ -712,8 +716,12 @@ async function writeStory(cat, topItems, chat) {
     feedback = `\n\nA first draft broke these rules: ${[...p.hard, ...p.soft].join("; ")}. Write a new one that keeps every rule.`;
   }
   if(best.hard.length) return null;
-  const lead = topItems.find(i => i.id === best.lead);
-  return { headline:sentenceCase(best.headline, storyFacts(lead)), dek:best.dek, lead:best.lead };
+  const f = storyFacts(topItems.find(i => i.id === best.lead));
+  // "Joey-1 costs…" → "joey-1 costs…": a name the item writes in lower case stays that way
+  const first = words(best.dek)[0] || "", known = `${f.title} ${f.details}`;
+  const dek = /[\d-]/.test(first) && first !== first.toLowerCase() && known.includes(bare(first).toLowerCase()) && !known.includes(bare(first))
+    ? first.toLowerCase() + best.dek.slice(first.length) : best.dek;
+  return { headline:sentenceCase(best.headline, f), dek, lead:best.lead };
 }
 
 // `prev` is the last digest: a category whose top items haven't changed keeps its story.
