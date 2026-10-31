@@ -570,20 +570,22 @@ function storyFacts(i) {
   return { source, title, details };
 }
 
-const STORY_PROMPT = (label, facts) => `You are the editor of CobunAI, a daily news brief for developers who build with AI. Turn today's top "${label}" items into one news story.
+// The category comes last, after the examples: Ollama reuses the cached prompt start across calls,
+// which makes each call several times faster on a CPU runner
+const STORY_PROMPT = (label, facts) => `You are the editor of CobunAI, a daily news brief for developers who build with AI. You turn a list of items into one news story.
 
 Choose the ONE item that is the biggest news for these readers: a launch, release, deal or result beats an essay or an opinion piece. Reply with JSON: {"pick": <item number>, "headline": "...", "dek": "..."}
 
-headline: who did what, in at most 10 words. Start with who (the company, lab, person or project; "Researchers" for a paper), then an active verb, in plain words. No colons, no "owner/repo" names, no title copied word for word.
-dek: one sentence of at most 20 words with the most concrete fact in the item: a number, a name, or what exactly changed. Never start it with "It" or "This". No filler such as "simplifying", "enabling", "impacting" or "changing how developers work".
-Use only facts written in the item. Never add numbers, names or claims that are not there.
+headline: who did what, in at most 10 words. Start with who (the company, lab, person or project; "Researchers" for a paper), then an active verb. Say what is new about it or what it does differently, not just that it was released or launched. Plain words. No colons, no "owner/repo" names, no title copied word for word.
+dek: one complete sentence of at most 20 words that adds the most concrete fact the headline left out: a number, a name, or what exactly changed. Write it like a newspaper, with "a" and "the" where they belong. Never start it with "It" or "This". No filler such as "simplifying", "enabling", "impacting" or "changing how developers work".
+Use only facts written in the item, and spell names exactly as the item does. Never add numbers, names or claims that are not there.
 
 Examples of the style:
 
 1. Source: Meta AI
 Title: Introducing Llama 3.1: Our most capable models to date
 Details: Llama 3.1 comes in 8B, 70B and 405B sizes, with a 128K-token context window and support for eight languages.
-{"pick": 1, "headline": "Meta releases Llama 3.1 in sizes up to 405B", "dek": "All three sizes read 128K tokens of context and support eight languages."}
+{"pick": 1, "headline": "Meta's biggest open Llama model reaches 405B parameters", "dek": "Llama 3.1 comes in three sizes, each with a 128K-token context window and eight languages."}
 
 1. Source: GitHub
 Title: GitHub repo browser-use by browser-use
@@ -595,7 +597,7 @@ Title: Scaling Laws for Neural Language Models
 Details: We study empirical scaling laws for language model performance on the cross-entropy loss. The loss scales as a power-law with model size, dataset size, and the amount of compute used for training.
 {"pick": 1, "headline": "Researchers find language models improve predictably with scale", "dek": "Loss falls as a power law as model size, data and training compute grow."}
 
-Today's items:
+Today's top "${label}" items:
 
 ${facts.map((f,idx) => `${idx+1}. Source: ${f.source}\nTitle: ${f.title}${f.details ? `\nDetails: ${f.details}` : ""}`).join("\n\n")}
 
@@ -629,6 +631,7 @@ function storyProblems({ headline, dek }, f) {
   if(/:/.test(headline)) hard.push("the headline has a colon");
   if(/[A-Za-z][\w.-]*\/[A-Za-z][\w.-]+/.test(headline)) hard.push("the headline has an owner/repo name");
   if(/^(it|this|these)\b/i.test(dek)) soft.push(`the dek starts with "${words(dek)[0]}"`);
+  if(/\b(releases?|launch(es)?|announces?|introduces?|unveils?)\b/i.test(headline)) soft.push("the headline only says it was released; say what is new about it");
   const filler = `${headline} ${dek}`.match(FILLER);
   if(filler) soft.push(`"${filler[0]}" is filler`);
   // Names and numbers must come from the item
