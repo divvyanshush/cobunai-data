@@ -1,0 +1,77 @@
+name: Build data
+
+# Every hour: fetch all sources, write AI summaries with an open model running on the
+# runner itself (Ollama, no API key), and publish the JSON to GitHub Pages.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["pipeline.js", "build.js", "package-lock.json", ".github/workflows/build.yml"]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write # re-enable this workflow each run so GitHub doesn't pause the schedule
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  LLM_MODEL: qwen2.5:3b
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Cache model
+        uses: actions/cache@v6
+        with:
+          path: ~/.ollama/models
+          key: ollama-${{ env.LLM_MODEL }}
+
+      - name: Start open model (Ollama)
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl stop ollama || true
+          OLLAMA_MODELS="$HOME/.ollama/models" nohup ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:11434/api/version && break; sleep 1; done
+          ollama pull "$LLM_MODEL"
+
+      - name: Build data
+        env:
+          LLM_URL: http://localhost:11434/v1
+          GITHUB_TOKEN: ${{ github.token }}
+          PREV_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+        run: node build.js && cat public/status.json
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: public
+
+      - id: deploy
+        uses: actions/deploy-pages@v5
+
+      - name: Keep the hourly schedule alive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/build.yml/enable" || true

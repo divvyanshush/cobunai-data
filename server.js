@@ -1,11 +1,11 @@
+// Legacy API for the Render deploy. cobunai.com is moving to the static JSON that build.js
+// publishes to GitHub Pages — delete this file (and express/cors) once the site reads that.
 import express from "express";
 import cors from "cors";
-import Parser from "rss-parser";
-import crypto from "crypto";
+import { fetchAll, generateWhys, buildDigest } from "./pipeline.js";
 
-const app    = express();
-const parser = new Parser({ timeout: 10000, headers: { "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" } });
-const PORT   = process.env.PORT || 3001;
+const app  = express();
+const PORT = process.env.PORT || 3001;
 
 app.use(cors({ origin: "*" }));
 app.use(express.json());
@@ -23,9 +23,6 @@ const rateLimit = (key, maxReqs, windowMs) => {
   rateLimitMap.set(key, record);
   return record.count > maxReqs;
 };
-
-const CACHE = { items: [], lastFetch: 0 };
-const CACHE_TTL = 14 * 60 * 1000; // 14 min — just under auto-refresh interval
 
 // ── Groq ──────────────────────────────────────────────────────────
 // Groq retires models without notice, so pick the first preferred one this key can use.
@@ -59,7 +56,6 @@ async function pickGroqModel() {
 }
 
 async function groqChat(prompt, { maxTokens=200, temperature=0.3, timeout=20000 }={}) {
-  if(!process.env.GROQ_API_KEY) throw new Error("GROQ_API_KEY not set");
   if(!GROQ_MODEL && !(await pickGroqModel())) throw new Error("No Groq chat model available");
   // gpt-oss models spend tokens reasoning before answering
   const reasoning = GROQ_MODEL.startsWith("openai/gpt-oss");
@@ -83,549 +79,52 @@ async function groqChat(prompt, { maxTokens=200, temperature=0.3, timeout=20000 
   return data.choices?.[0]?.message?.content?.trim() || "";
 }
 
-// ── AI keyword filter ─────────────────────────────────────────────
-const AI_KW = [
-  "llm","gpt","claude","gemini","openai","anthropic","mistral","llama","grok",
-  "deepseek","qwen","phi-","falcon","bloom","palm","bard","copilot","chatgpt",
-  "deepmind","openai","hugging face","huggingface","nvidia","groq","perplexity",
-  "midjourney","sora","runway","stability","cohere","xai","inflection","adept",
-  "artificial intelligence"," ai ","ai-","machine learning","deep learning",
-  "neural network","transformer","diffusion","embedding","inference","fine-tun",
-  "rlhf","rag","retrieval","vector","multimodal","foundation model","language model",
-  "generative ai","computer vision","nlp","natural language","reinforcement learning",
-  "alignment","hallucin","benchmark","dataset","parameter","token","attention",
-  "latent","autoregressive","quantiz","distillation","lora","prompt","agent",
-  "cursor","replit","github copilot","tabnine","codewhisperer","devin","bolt",
-  "v0 ","lovable","vercel ai","langchain","llamaindex","autogpt","babyagi",
-  "stable diffusion","dall-e","dall·e","imagen","firefly","whisper","elevenlabs",
-  "agi","superintelligence","ai safety","ai regulation","ai policy","ai ethics",
-  "ai startup","ai funding","ai research","ai model","ai tool","ai agent",
-  "ai generated","ai powered","ai based","ai driven","large model","small model",
-  "open source model","open weight","model release","model launch",
-];
-const isAI = t => { const s=(t||"").toLowerCase(); return AI_KW.some(k=>s.includes(k)); };
-
-const guessType = (t, body="", src="") => {
-  const s = ((t||"")+" "+(body||"")).toLowerCase();
-  const title = (t||"").toLowerCase();
-
-  // Source-based — most reliable signal
-  if(src==="GitHub") return "repo";
-  if(src==="HN" || src==="Lobste.rs" || src==="LessWrong" || src==="AlignmentForum") return "discuss";
-  if(src==="arXiv") return "research";
-
-  // Funding — very specific signals only
-  if (/series [abcde] |seed round|funding round|\$\d+[mb] raise|acqui[a-z]+ |merger|ipo/.test(s)) return "funding";
-
-  // Model — specific model names anywhere in title
-  if (/\bgpt-[\d.]|claude [\d]|claude opus|claude sonnet|claude haiku|gemini [\d.]|llama [\d]|llama-[\d]|mistral [\d]|deepseek-|deepseek [\d]|qwen[\d]|phi-[\d]|grok-[\d]|gpt-4|gpt-5|o1 |o3 |o1-|o3-/.test(title)) return "model";
-  if (/\b(releases?|launches?|ships?|announces?|introduces?)\b.{0,30}\b(model|api|weights?)\b/.test(title)) return "model";
-  if (/open.?(source[sd]?|weights?) .{0,20}\bmodel|model card|weights (are )?(now )?available/.test(title)) return "model";
-
-  // Research — academic signals in title only (not body — too noisy)
-  if (/\bpaper\b|\bsurvey\b|\bpreprint\b|\bbenchmark\b/.test(title)) return "research";
-  if (/: a .{3,30} (approach|method|framework|system|model)$/i.test(t||"")) return "research";
-
-  // Policy
-  if (/regulation|eu ai act|senate|congress|executive order|copyright law|lawsuit|sued/.test(title)) return "policy";
-
-  // Drama
-  if (/fired|resign|scandal|layoff|laid off/.test(title)) return "drama";
-
-  return "tool";
-};
-
-
-const guessTags = (t, body="") => {
-  const s = ((t||"")+" "+(body||"")).toLowerCase();
-  const tags = [];
-  // Frameworks & tools
-  if (/rag|retrieval.augmented|retrieval augmented/.test(s)) tags.push("RAG");
-  if (/agent[s]?|agentic|multi.agent|autonomous agent/.test(s)) tags.push("Agents");
-  if (/llm[s]?|large language model/.test(s)) tags.push("LLM");
-  if (/fine.tun|finetuning|finetune|lora|qlora|peft/.test(s)) tags.push("Fine-tuning");
-  if (/diffusion|stable diffusion|image gen|text.to.image|dall.e|midjourney|flux/.test(s)) tags.push("Diffusion");
-  if (/multimodal|multi.modal|vision.language|vlm|image.text|text.image/.test(s)) tags.push("Multimodal");
-  if (/transformer[s]?|attention mechanism|self.attention/.test(s)) tags.push("Transformer");
-  if (/rlhf|reinforcement learning from|reward model|ppo|grpo/.test(s)) tags.push("RLHF");
-  if (/vector.db|vector database|embedding[s]?|semantic search|pinecone|weaviate|chroma/.test(s)) tags.push("Embeddings");
-  if (/langchain|llamaindex|llama.index|haystack/.test(s)) tags.push("LangChain");
-  if (/open.?source|open weight|open model/.test(s)) tags.push("Open Source");
-  if (/benchmark[s]?|leaderboard|eval[s]?|mmlu|hellaswag|gsm8k/.test(s)) tags.push("Benchmark");
-  if (/reasoning|chain.of.thought|cot|o1|r1|thinking model/.test(s)) tags.push("Reasoning");
-  if (/code.gen|coding model|code model|copilot|devin|swe.bench/.test(s)) tags.push("Code");
-  if (/safety|alignment|jailbreak|red.team|guardrail|bias|harmless/.test(s)) tags.push("Safety");
-  return tags.slice(0, 3); // max 3 tags per item
-};
-
-// Source credibility weights — how much we trust each source
-const SRC_WEIGHT = {
-  // Tier 1 — must-read for AI builders
-  Karpathy: 1.4, LilianWeng: 1.3, SimonW: 1.25,
-  Anthropic: 1.2, OpenAI: 1.2, Mistral: 1.15,
-  DeepMind: 1.15, GoogleResearch: 1.1, MetaAI: 1.05,
-  Raschka: 1.05, Interconnects: 1.0, DeepLearningAI: 1.0,
-  // Tier 2 — strong community signals
-  HN: 1.0, "Lobste.rs": 0.95, LessWrong: 0.9, AlignmentForum: 0.9,
-  HuggingFace: 1.0, LangChain: 0.95, LlamaIndex: 0.95,
-  WandB: 0.95, FastAI: 0.95, TogetherAI: 0.92, Cohere: 0.92,
-  arXiv: 0.88, GitHub: 0.88, ImportAI: 1.05, TheSequence: 0.92,
-  // Tier 3 — useful but lower signal
-  Microsoft: 0.82, MITReview: 0.82, "Dev.to": 0.78,
-  TDS: 0.75, MarkTechPost: 0.72,
-  // Tier 4 — general tech media
-  TechCrunch: 0.68, TheVerge: 0.65, VentureBeat: 0.65,
-  Wired: 0.62,
-};
-
-// Developer relevance keywords — boost items that matter to builders
-const DEV_KEYWORDS = [
-  "open.source","released","launches","api","benchmark","outperforms",
-  "fine.tun","training","inference","deploy","model","dataset","paper",
-  "research","agent","rag","embedding","llm","gpt","claude","gemini",
-  "mistral","llama","open.weights","arxiv","github","repo"
-];
-
-const heatScore = (score, comments, src, time, title="", sum="") => {
-  const text = (title + " " + sum).toLowerCase();
-
-  // Base engagement score per source
-  const rawEngagement =
-      src==="HN"        ? Math.min(score/3, 60)  + Math.min((comments||0)/2, 30)
-    : src==="Dev.to"    ? Math.min(score/1.5, 55) + Math.min((comments||0)/2, 25)
-    : src==="GitHub"    ? Math.min(score/4, 70)   + Math.min((comments||0)/2, 25)
-    : src==="Lobste.rs" ? Math.min(score/2, 50)   + Math.min((comments||0)/2, 25)
-    : src==="arXiv"     ? 38
-    : src==="OpenAI" || src==="Anthropic" ? 72
-    : src==="GoogleResearch" || src==="MetaAI" || src==="HuggingFace" ? 62
-    : src==="MITReview" || src==="Interconnects" || src==="SimonW" ? 52
-    : src==="TechCrunch" || src==="TheVerge" || src==="VentureBeat" ? 48
-    : 40;
-
-  // Source credibility multiplier
-  const credibility = SRC_WEIGHT[src] || 0.65;
-
-  // Developer relevance boost — up to +15 points
-  const devMatches = DEV_KEYWORDS.filter(kw => text.includes(kw.replace(".","")||kw)).length;
-  const devBoost = Math.min(devMatches * 3, 15);
-
-  // GitHub star velocity boost
-  const starBoost = src==="GitHub" && score > 1000 ? Math.min((score-1000)/150, 25) : 0;
-
-  const engagement = (rawEngagement * credibility) + devBoost + starBoost;
-
-  // Time decay — items lose heat after 6 hours, heavily after 24h
-  const ageHours = time ? (Date.now()/1000 - time) / 3600 : 0;
-  const decay = ageHours < 2  ? 1.0
-              : ageHours < 6  ? 0.92
-              : ageHours < 12 ? 0.78
-              : ageHours < 24 ? 0.58
-              : ageHours < 48 ? 0.38
-              : 0.2;
-
-  return Math.min(Math.round(engagement * decay), 99);
-};
-
-const safeText = t => (t||"").replace(/<[^>]+>/g,"").replace(/\s+/g," ").trim();
-
-// ── FETCHERS ──────────────────────────────────────────────────────
-
-async function fetchHN() {
-  // Fetch top, ask, and show stories in parallel
-  const [topRes, askRes, showRes] = await Promise.allSettled([
-    fetch("https://hacker-news.firebaseio.com/v0/topstories.json", {signal:AbortSignal.timeout(10000)}).then(r=>r.json()),
-    fetch("https://hacker-news.firebaseio.com/v0/askstories.json", {signal:AbortSignal.timeout(10000)}).then(r=>r.json()),
-    fetch("https://hacker-news.firebaseio.com/v0/showstories.json", {signal:AbortSignal.timeout(10000)}).then(r=>r.json()),
-  ]);
-
-  const topIds = topRes.status==="fulfilled" ? topRes.value.slice(0,120) : [];
-  const askIds = askRes.status==="fulfilled" ? askRes.value.slice(0,30) : [];
-  const showIds = showRes.status==="fulfilled" ? showRes.value.slice(0,30) : [];
-
-  const seen = new Set();
-  const allIds = [...topIds, ...askIds, ...showIds].filter(id => {
-    if(seen.has(id)) return false;
-    seen.add(id);
-    return true;
-  });
-
-  // Batches of 30 — firing ~300 requests at once times out on a small Render instance
-  const rows = [];
-  for(let i = 0; i < allIds.length; i += 30) {
-    rows.push(...await Promise.allSettled(allIds.slice(i, i+30).map(id =>
-      fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`, {signal:AbortSignal.timeout(8000)}).then(r=>r.json())
-    )));
-  }
-  return rows
-    .filter(r => r.status==="fulfilled" && r.value?.title && isAI(r.value.title))
-    .map(({value:s}) => ({
-      id:`hn-${s.id}`, src:"HN", type:"discuss", tags:guessTags(s.title), title:s.title,
-      sum: s.text ? safeText(s.text).slice(0,220)+"…" : "Discussion on Hacker News.",
-      link: s.url||`https://news.ycombinator.com/item?id=${s.id}`,
-      time:s.time, score:s.score||0, comments:s.descendants||0,
-    }));
-}
-
-const ARXIV_RELEVANCE = (title, summary="") => {
-  const s = (title + " " + summary).toLowerCase();
-  let score = 0;
-  const HIGH = [/\bllm\b/,/\blarge language model/,/\bagents?\b/,/\breasoning\b/,
-    /fine.tun/,/\brlhf\b/,/\brag\b|retrieval.augmented/,/\binference\b/,
-    /context.length|context window/,/\bmultimodal\b/,/\bembedding/,
-    /\bvlm\b|vision.language/,/chain.of.thought/,/\bcode gen|code model/];
-  const MED = [/\btransformer\b/,/\battention\b/,/\bdiffusion\b/,/\bbenchmark\b/,/\bevaluat/];
-  const LABS = [/google|deepmind|openai|anthropic|meta |microsoft|mistral|hugging/];
-  HIGH.forEach(r => { if(r.test(s)) score += 3; });
-  MED.forEach(r => { if(r.test(s)) score += 1; });
-  LABS.forEach(r => { if(r.test(s)) score += 2; });
-  return score;
-};
-
-async function fetchArxiv() {
-  const res = await fetch("https://export.arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.LG+OR+cat:cs.CL+OR+cat:cs.CV&sortBy=lastUpdatedDate&sortOrder=descending&max_results=60", {signal:AbortSignal.timeout(20000)});
-  const text = await res.text();
-  const entries = text.split("<entry>").slice(1);
-  return entries.map(e => {
-    const get = tag => { const m=e.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`)); return m?m[1].trim():""; };
-    const title   = get("title").replace(/\n/g," ").trim();
-    const summary = safeText(get("summary")).slice(0,240)+"…";
-    const link    = (e.match(/<id>([\s\S]*?)<\/id>/)||[])[1]?.trim()||"https://arxiv.org";
-    const pub     = (e.match(/<published>([\s\S]*?)<\/published>/)||[])[1]?.trim();
-    const time    = pub ? Math.floor(new Date(pub).getTime()/1000) : Math.floor(Date.now()/1000);
-    const authors = (e.match(/<name>([\s\S]*?)<\/name>/g)||[]).slice(0,3).map(a=>a.replace(/<\/?name>/g,"")).join(", ");
-    return { id:`arxiv-${link.split("/abs/")[1]||Math.random()}`, src:"arXiv", type:"research", tags:guessTags(title, summary), title, sum:summary, link, time, score:0, comments:0, authors };
-  }).filter(e=>e.title);
-}
-
-async function fetchDevTo() {
-  const [r1, r2] = await Promise.allSettled([
-    fetch("https://dev.to/api/articles?tag=ai&per_page=30&top=1", {signal:AbortSignal.timeout(10000)}).then(r=>r.json()),
-    fetch("https://dev.to/api/articles?tag=machinelearning&per_page=20&top=1", {signal:AbortSignal.timeout(10000)}).then(r=>r.json()),
-  ]);
-  const seen = new Set();
-  const combined = [
-    ...(r1.status==="fulfilled" ? r1.value : []),
-    ...(r2.status==="fulfilled" ? r2.value : []),
-  ].filter(a => {
-    if(seen.has(a.id)) return false;
-    seen.add(a.id);
-    return true; // arXiv already filtered to AI categories
-  });
-  return combined.map(a=>({
-    id:`devto-${a.id}`, src:"Dev.to", type:guessType(a.title), tags:guessTags(a.title), title:a.title,
-    sum: safeText(a.description||"").slice(0,220)+"…",
-    link:a.url, time:Math.floor(new Date(a.published_at).getTime()/1000),
-    score:a.positive_reactions_count||0, comments:a.comments_count||0,
-  }));
-}
-
-async function fetchLobsters() {
-  const res = await fetch("https://lobste.rs/t/ai.json", {signal:AbortSignal.timeout(10000)});
-  const json = await res.json();
-  return (json||[]).map(s=>({
-    id:`lobsters-${s.short_id}`, src:"Lobste.rs", type:"discuss", tags:guessTags(s.title), title:s.title,
-    sum:`${s.description||"Technical discussion on Lobste.rs."}`.slice(0,220),
-    link:s.url||`https://lobste.rs/s/${s.short_id}`,
-    time:Math.floor(new Date(s.created_at).getTime()/1000),
-    score:s.score||0, comments:s.comment_count||0,
-  }));
-}
-
-async function fetchGitHub() {
-  const queries = [
-    "topic:llm+stars:%3E200",
-    "topic:ai-agents+stars:%3E100",
-    "topic:large-language-models+stars:%3E100",
-    "topic:generative-ai+stars:%3E200",
-    "topic:rag+stars:%3E100",
-  ];
-
-  const results = await Promise.allSettled(queries.map(q =>
-    fetch(`https://api.github.com/search/repositories?q=${q}&sort=updated&order=desc&per_page=15`, {
-      headers:{"Accept":"application/vnd.github.v3+json","User-Agent":"pulse-app/1.0"},
-      signal:AbortSignal.timeout(10000)
-    }).then(r=>r.json())
-  ));
-
-  const seen = new Set();
-  const repos = [];
-  for(const r of results) {
-    if(r.status !== "fulfilled") continue;
-    for(const repo of (r.value?.items||[])) {
-      if(seen.has(repo.id)) continue;
-      seen.add(repo.id);
-      repos.push({
-        id:`github-${repo.id}`, src:"GitHub", type:"repo",
-        title:repo.full_name,
-        sum:(repo.description||"No description.").slice(0,220),
-        link:repo.html_url,
-        time:Math.floor(new Date(repo.pushed_at||repo.updated_at).getTime()/1000),
-        score:repo.stargazers_count||0, comments:repo.forks_count||0,
-      });
-    }
-  }
-  return repos;
-}
-
-async function fetchRSS(url, src, srcLabel, aiOnly=false, customHeaders={}) {
-  const feedParser = Object.keys(customHeaders).length > 0
-    ? new Parser({ timeout:10000, headers:{ "Accept":"application/rss+xml, application/atom+xml, application/xml, text/xml, */*", ...customHeaders } })
-    : parser;
-  const feed = await feedParser.parseURL(url);
-  const pubTime = e => e.pubDate ? new Date(e.pubDate).getTime() : 0;
-  // Some feeds (OpenAI, HuggingFace) list hundreds of posts in no particular order
-  return [...(feed.items||[])].sort((a,b) => pubTime(b) - pubTime(a)).slice(0, 20)
-    .filter(e => aiOnly || isAI(e.title||""))
-    .map(e=>({
-      // Hash the whole link — a short prefix is identical for every post on a site
-      id:`${src.toLowerCase().replace(/\s/g,"-")}-${crypto.createHash("sha1").update(e.link||e.title||"").digest("hex").slice(0,16)}`,
-      src, srcLabel:srcLabel||src, type:guessType(e.title||"", e.contentSnippet||e.summary||""), tags:guessTags(e.title||"", e.contentSnippet||e.summary||""),
-      title:(e.title||"").replace(/\n/g," ").trim(),
-      sum:safeText(e.contentSnippet||e.summary||e.content||"").slice(0,240)+"…",
-      link:e.link||"", time:e.pubDate?Math.floor(new Date(e.pubDate).getTime()/1000):Math.floor(Date.now()/1000),
-      score:0, comments:0, authors:e.creator||e.author||"",
-    }));
-}
-
-const RSS_SOURCES = [
-  { url:"https://openai.com/blog/rss.xml",                src:"OpenAI",      label:"OpenAI Blog",    aiOnly:true },
-  // DeepMind gzips the body for non-browser user agents, which rss-parser can't read
-  { url:"https://deepmind.google/blog/rss.xml",           src:"DeepMind",    label:"DeepMind Blog",  aiOnly:true, headers:{ "User-Agent":"Mozilla/5.0 (compatible; CobunAI/1.0; +https://cobunai.com)" } },
-  { url:"https://research.google/blog/rss/",              src:"GoogleResearch", label:"Google Research", aiOnly:true },
-  { url:"https://huggingface.co/blog/feed.xml",           src:"HuggingFace", label:"HuggingFace Blog",aiOnly:true },
-  { url:"https://techcrunch.com/category/artificial-intelligence/feed/", src:"TechCrunch", label:"TechCrunch AI", aiOnly:true },
-  { url:"https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", src:"TheVerge", label:"The Verge AI", aiOnly:true },
-  { url:"https://www.wired.com/feed/tag/ai/latest/rss",   src:"Wired",       label:"Wired AI",       aiOnly:true },
-  { url:"https://www.technologyreview.com/feed/",         src:"MITReview",   label:"MIT Tech Review", aiOnly:true },
-  { url:"https://simonwillison.net/atom/everything/",     src:"SimonW",      label:"Simon Willison",  aiOnly:true },
-  { url:"https://www.interconnects.ai/feed",              src:"Interconnects",label:"Interconnects",  aiOnly:true },
-  { url:"https://towardsdatascience.com/feed",            src:"TDS",         label:"Towards Data Science", aiOnly:true },
-  { url:"https://www.marktechpost.com/feed/",             src:"MarkTechPost", label:"MarkTechPost",   aiOnly:true },
-  { url:"https://bdtechtalks.com/feed/",                  src:"TechTalks",   label:"BD Tech Talks",   aiOnly:true },
-  { url:"https://thesequence.substack.com/feed",          src:"TheSequence", label:"The Sequence",    aiOnly:true },
-  { url:"https://lastweekin.ai/feed",                     src:"LastWeekInAI",label:"Last Week in AI", aiOnly:true },
-  { url:"https://importai.substack.com/feed",             src:"ImportAI",    label:"Import AI",       aiOnly:true },
-  { url:"https://www.together.ai/blog/rss.xml", src:"TogetherAI", label:"Together AI", aiOnly:true },
-  { url:"https://magazine.sebastianraschka.com/feed", src:"Raschka", label:"Sebastian Raschka", aiOnly:true },
-  { url:"https://lilianweng.github.io/index.xml", src:"LilianWeng", label:"Lilian Weng", aiOnly:true },
-  { url:"https://karpathy.bearblog.dev/feed/", src:"Karpathy", label:"Andrej Karpathy", aiOnly:true },
-  { url:"https://blog.langchain.dev/rss.xml", src:"LangChain", label:"LangChain Blog", aiOnly:true },
-  { url:"https://www.lesswrong.com/feed.xml", src:"LessWrong", label:"LessWrong", aiOnly:true },
-  { url:"https://alignmentforum.org/feed.xml", src:"AlignmentForum", label:"Alignment Forum", aiOnly:true },
-];
-
-
-// ── Topic clustering — deduplicate same-story coverage ────────────
-function clusterItems(items) {
-  const STOP = new Set([
-    "the","a","an","in","of","to","for","and","or","with","on","at","by",
-    "how","what","why","when","new","ai","using","use","your","from","its",
-    "this","that","are","is","was","we","our","can","get","will","has",
-    "have","about","into","more","based","via","vs","model","models","llm",
-    "large","language","learning","deep","machine","neural","data","paper",
-    "build","building","make","making","system","systems","open","source","free","local","tool","tools","show","built","agent","agents","code","based"
-  ]);
-
-  const getKeywords = (title) => {
-    return title.toLowerCase()
-      .replace(/[^a-z0-9 ]/g," ")
-      .split(/\s+/)
-      .filter(w => w.length > 3 && !STOP.has(w));
-  };
-
-  const clustered = [];
-  const used = new Set();
-
-  // Sort by heat descending — lead item is always highest heat
-  const sorted = [...items].sort((a,b) => (b.heat||0) - (a.heat||0));
-
-  for(const item of sorted) {
-    if(used.has(item.id)) continue;
-    const kw = new Set(getKeywords(item.title || ""));
-    if(kw.size === 0) { clustered.push(item); used.add(item.id); continue; }
-
-    const related = [];
-    // Don't cluster GitHub repos with each other
-    if(item.src === "GitHub") {
-      clustered.push({ ...item, relatedCount: 0 });
-      used.add(item.id);
-      continue;
-    }
-    for(const other of sorted) {
-      if(used.has(other.id) || other.id === item.id) continue;
-      // Don't pull GitHub repos into news clusters
-      if(other.src === "GitHub") continue;
-      const okw = getKeywords(other.title || "");
-      const overlap = okw.filter(w => kw.has(w)).length;
-      const timeDiff = Math.abs((item.time||0) - (other.time||0));
-      // HN/Lobsters need higher overlap threshold — titles are short and noisy
-      const threshold = (item.src==="HN"||item.src==="Lobste.rs"||other.src==="HN"||other.src==="Lobste.rs") ? 3 : 2;
-      if(overlap >= threshold && timeDiff < 172800) {
-        related.push({ id:other.id, title:other.title, src:other.src, link:other.link, heat:other.heat });
-        used.add(other.id);
-      }
-    }
-
-    clustered.push({
-      ...item,
-      related: related.length > 0 ? related : undefined,
-      relatedCount: related.length
-    });
-    used.add(item.id);
-  }
-
-  return clustered;
-}
-
-// ── Main aggregator ────────────────────────────────────────────────
-async function fetchAll() {
-  console.log("🔄 Fetching all sources…");
-  const results = await Promise.allSettled([
-    fetchHN(), fetchArxiv(), fetchDevTo(),
-    fetchLobsters(), fetchGitHub(),
-    ...RSS_SOURCES.map(s => fetchRSS(s.url, s.src, s.label, s.aiOnly, s.headers||{})),
-  ]);
-  const labels = ["HN","arXiv","Dev.to","Lobste.rs","GitHub",...RSS_SOURCES.map(s=>s.label)];
-  const items = results
-    .filter(r => r.status==="fulfilled")
-    .flatMap(r => r.value)
-    .map(i => ({ ...i, heat: heatScore(i.score, i.comments, i.src, i.time, i.title||"", i.sum||"") }));
-  results.forEach((r,i) => {
-    if(r.status==="rejected") console.warn(`⚠  ${labels[i]} failed:`, r.reason?.message);
-    else console.log(`✓  ${labels[i]}: ${r.value.length} items`);
-  });
-  // Content filter — remove jailbreaks, prompt injections, spam
-  const BLOCK_KEYWORDS = [
-    "jailbreak","liberat","disregard prev","clear your mind","new instruct",
-    "DISREGARD","PREV. INSTRUCT","liberation prompt","harmful prompt",
-    "bypass","uncensor","DAN prompt","ignore previous"
-  ];
-  const filtered = items.filter(i => {
-    const text = ((i.title||"")+" "+(i.sum||"")).toLowerCase();
-    return !BLOCK_KEYWORDS.some(kw => text.includes(kw.toLowerCase()));
-  });
-
-  const seen = new Set();
-  const titleSeen = new Set();
-  const normalize = t => t.toLowerCase().replace(/[^a-z0-9]/g,"").slice(0,60);
-  const unique = filtered.filter(i => {
-    if(!i.title || seen.has(i.id)) return false;
-    const tk = normalize(i.title);
-    // Check for similar titles (first 60 normalized chars)
-    if(titleSeen.has(tk)) return false;
-    seen.add(i.id);
-    titleSeen.add(tk);
-    return true;
-  });
-  // Cap arXiv at top 25 by relevance score
-  const arxivItems = unique.filter(i => i.src === "arXiv")
-    .map(i => ({ ...i, _rel: ARXIV_RELEVANCE(i.title, i.sum) }))
-    .sort((a,b) => b._rel - a._rel || b.time - a.time)
-    .slice(0, 25);
-  const nonArxiv = unique.filter(i => i.src !== "arXiv");
-  const capped = [...nonArxiv, ...arxivItems];
-  capped.sort((a,b) => b.time - a.time);
-  const finalItems = capped;
-  unique.length = 0;
-  unique.push(...finalItems);
-  unique.sort((a,b) => b.time - a.time);
-  const clustered = clusterItems(unique);
-  console.log(`✅ Total: ${clustered.length} items (clustered from ${unique.length})\n`);
-  return clustered;
-}
-
-// ── Background "why this matters" generator ────────────────────
+// ── Cache ─────────────────────────────────────────────────────────
+const CACHE = { items: [], lastFetch: 0 };
 const WHY_CACHE = new Map();
 let DIGEST_CACHE = { data: null, ts: 0 };
-// Clear on each deploy to regenerate with new prompt
-
-async function generateWhys(items) {
-  // Only process top 30 by heat that don't have a why yet
-  const top30 = [...items]
-    .sort((a,b)=>(b.heat||0)-(a.heat||0))
-    .filter(i => i.src !== "GitHub")
-    .slice(0,30)
-    .filter(i => !WHY_CACHE.has(i.id));
-
-  if(!top30.length) return;
-
-  try {
-    const prompt = `You are a senior engineer writing a daily briefing for AI developers. For each item below, write ONE short sentence (max 10 words) that answers: "So what? Why does this matter to someone building AI products?" Focus on practical impact — cost, speed, capability, or workflow change. Never restate the title. Skip items that are not genuinely useful to developers (tutorials, listicles, spam) by returning an empty string for those.
-Return ONLY a valid JSON object mapping id to sentence. Example: {"id1":"Cuts inference cost by 40% on consumer hardware.","id2":""}
-
-Items:
-${top30.map(i=>`{"id":"${i.id}","title":${JSON.stringify(i.title)},"sum":${JSON.stringify((i.sum||"").slice(0,120))}}`).join("\n")}`;
-
-    const raw = (await groqChat(prompt, { maxTokens:900, temperature:0.2, timeout:30000 })) || "{}";
-    const clean = raw.replace(/```json|```/g,"").trim();
-    let whys = {};
-    try {
-      const match = clean.match(/\{[\s\S]*\}/);
-      if(match) whys = JSON.parse(match[0]);
-    } catch(e2) {
-      const lines = clean.split("\n");
-      for(const line of lines) {
-        const m = line.match(/"([^"]+)"\s*:\s*"([^"]*)"/);
-        if(m) whys[m[1]] = m[2];
-      }
-    }
-    Object.entries(whys).forEach(([id,why])=>{ if(why) WHY_CACHE.set(id,why); });
-    console.log("Generated "+Object.keys(whys).length+" why-this-matters");
-  } catch(e) {
-    console.warn("Why generation failed:", e.message);
-  }
-}
-
 const withWhys = items => items.map(i => ({ ...i, why: WHY_CACHE.get(i.id) || "" }));
 
-// ── Routes ─────────────────────────────────────────────────────────
+async function refresh() {
+  const { items } = await fetchAll();
+  if(!items.length) return console.log("⚠️ fetchAll returned empty — keeping existing cache");
+  CACHE.items = withWhys(items);
+  CACHE.lastFetch = Date.now();
+  DIGEST_CACHE = { data: null, ts: 0 };
+  await generateWhys(items, groqChat, WHY_CACHE);
+  CACHE.items = withWhys(items);
+  console.log(`✅ Cache refreshed — ${CACHE.items.length} items`);
+}
 
+// ── Routes ────────────────────────────────────────────────────────
 app.get("/feed", async (req, res) => {
   try {
-    const now = Date.now();
     // Auto-refresh keeps the cache fresh — never make a visitor wait on a full fetch if we have items
-    if (CACHE.items.length > 0) {
-      return res.json({ items: CACHE.items, cached: true, age: Math.round((now-CACHE.lastFetch)/1000) });
-    }
-    const fetched = await fetchAll();
-    CACHE.items = withWhys(fetched);
-    CACHE.lastFetch = Date.now();
-    DIGEST_CACHE = { data: null, ts: 0 }; // invalidate digest when feed refreshes
-    res.json({ items: CACHE.items, cached: false, age: 0 });
+    if(!CACHE.items.length) await refresh();
+    res.json({ items: CACHE.items, cached: true, age: Math.round((Date.now()-CACHE.lastFetch)/1000) });
   } catch(err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Health
 app.get("/health", (_, res) => res.json({ ok:true, items:CACHE.items.length, lastFetch:CACHE.lastFetch, model:GROQ_MODEL }));
 
-// Force cache refresh
 app.get("/refresh", async (req, res) => {
   try {
-    console.log("🔄 Manual refresh triggered");
-    CACHE.items = [];
-    CACHE.lastFetch = 0;
-    DIGEST_CACHE = { data: null, ts: 0 };
-    const items = await fetchAll();
-    CACHE.items = items;
-    CACHE.lastFetch = Date.now();
-    res.json({ ok: true, items: items.length });
+    await refresh();
+    res.json({ ok: true, items: CACHE.items.length });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── AI SUMMARY ────────────────────────────────────────────────────
-// POST /summarize  { title, sum, src, type }
-// Returns { summary: "…" }
+// POST /summarize  { title, sum, src, type } → { summary }
 app.post("/summarize", async (req, res) => {
   const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "unknown";
   if(rateLimit(`summarize:${ip}`, 20, 60_000)) return res.status(429).json({ error: "Too many requests. Please slow down." });
   const { title, sum, src, type } = req.body || {};
   if (!title) return res.status(400).json({ error: "title required" });
-
   try {
     const prompt = `You are a staff engineer who reads everything in AI. Be direct and technical.
 
@@ -635,15 +134,7 @@ Source: ${src || "unknown"}
 Type: ${type || "unknown"}
 Summary: ${sum || "N/A"}
 
-Write 2-3 sentences for an AI builder audience:
-- Sentence 1: What exactly happened or what was found (be specific with numbers/names if relevant)
-- Sentence 2: What this means practically — what can you do now, what changes, what to watch
-- Sentence 3 (optional): Any gotcha, limitation, or context worth knowing
-
-Rules: no hype words, no "groundbreaking/revolutionary/exciting", be concrete, write like you're slacking a colleague.
-
-Reply with ONLY the summary, no preamble, no bullet points.`;
-
+Write 2-3 sentences for an AI builder audience: what happened, what it means practically, and any gotcha worth knowing. Use only the facts above. No hype words, no preamble, no bullet points.`;
     const summary = (await groqChat(prompt, { maxTokens:250 })) || "Could not generate summary.";
     res.json({ summary });
   } catch(e) {
@@ -652,132 +143,22 @@ Reply with ONLY the summary, no preamble, no bullet points.`;
   }
 });
 
-// ── Auto-refresh cache ─────────────────────────────────────────────
-setInterval(async () => {
-  try {
-    console.log("🔄 Auto-refreshing cache…");
-    const newItems = await fetchAll();
-    if(newItems && newItems.length > 0) {
-      // If new fetch has no GitHub items but old cache did, preserve them
-      const newGithub = newItems.filter(i => i.src === "GitHub");
-      const oldGithub = CACHE.items.filter(i => i.src === "GitHub");
-      const merged = newGithub.length === 0 && oldGithub.length > 0
-        ? [...newItems, ...oldGithub]
-        : newItems;
-      if(merged !== newItems) console.log("⚠️ GitHub fetch returned 0 — preserving previous GitHub items");
-      CACHE.items = withWhys(merged);
-      CACHE.lastFetch = Date.now();
-      DIGEST_CACHE = { data: null, ts: 0 };
-      await generateWhys(merged);
-      CACHE.items = withWhys(merged);
-      console.log(`✅ Cache refreshed — ${CACHE.items.length} items`);
-    } else {
-      console.log("⚠️ fetchAll returned empty — keeping existing cache");
-    }
-  } catch(e) {
-    console.error("Auto-refresh failed:", e.message);
-  }
-}, 15 * 60 * 1000);
-
-
-// ── GET /digest — category summaries ─────────────────────────────
 app.get("/digest", async (req, res) => {
-  res.set("Access-Control-Allow-Origin", "*");
-  if(DIGEST_CACHE.data && Date.now() - DIGEST_CACHE.ts < 10*60*1000) {
-    return res.json(DIGEST_CACHE.data);
-  }
+  if(DIGEST_CACHE.data && Date.now() - DIGEST_CACHE.ts < 10*60*1000) return res.json(DIGEST_CACHE.data);
   try {
-    const items = CACHE.items || [];
-    const now = Math.floor(Date.now()/1000);
-    const recent = items.filter(i => now - (i.time||0) < 172800);
-
-    const normalize = type => {
-      if(type==="product") return "tool";
-      if(type==="repo") return "repo";
-      if(type==="discuss") return "discuss";
-      return type || "tool";
-    };
-
-    const CATS = [
-      { id:"model",    label:"Models & Releases" },
-      { id:"tool",     label:"Tools & Libraries"  },
-      { id:"research", label:"Research & Papers"  },
-      { id:"repo",     label:"Repos & Projects"   },
-      { id:"discuss",  label:"Community"           },
-      { id:"funding",  label:"Funding & Business"  },
-    ];
-
-    const grouped = {};
-    for(const item of recent) {
-      const key = normalize(item.type);
-      if(!grouped[key]) grouped[key] = [];
-      grouped[key].push(item);
-    }
-    for(const key of Object.keys(grouped)) {
-      grouped[key].sort((a,b)=>(b.heat||0)-(a.heat||0));
-    }
-
-    const categoryPromises = CATS.map(async (cat) => {
-      const catItems = (grouped[cat.id] || []).slice(0,15);
-      if(catItems.length < 1) return null;
-      const topItems = catItems.slice(0,8);
-      const prompt = `You are a staff engineer giving a 30-second briefing on today's ${cat.label}.
-
-Items:
-${topItems.map((i,idx) => `${idx+1}. ${i.title}${i.sum ? " — " + i.sum.slice(0,100) : ""}`).join("\n")}
-
-Rules:
-- Name specific projects, models, or papers — no vague references
-- First sentence: what happened, be specific
-- Second sentence: what a developer should actually do — try it, watch it, read it, skip it
-- Max 2 sentences, no filler
-- No hype words: revolutionary, groundbreaking, exciting, significant
-- Write like a senior dev talking to another dev, not a newsletter
-
-Reply with ONLY the 2-sentence summary.`;
-      try {
-        const summary = await groqChat(prompt, { maxTokens:150, timeout:15000 });
-        return { id:cat.id, label:cat.label, summary, count:catItems.length,
-          items:catItems.map(i=>({id:i.id,title:i.title,src:i.src,srcLabel:i.srcLabel,type:i.type,
-            heat:i.heat,time:i.time,timeLabel:i.timeLabel,link:i.link,sum:i.sum,
-            score:i.score,comments:i.comments,authors:i.authors||""})) };
-      } catch(e) {
-        console.warn(`Digest summary failed (${cat.id}):`, e.message);
-        return { id:cat.id, label:cat.label, summary:"", count:catItems.length,
-          items:catItems.map(i=>({id:i.id,title:i.title,src:i.src,srcLabel:i.srcLabel,type:i.type,
-            heat:i.heat,time:i.time,timeLabel:i.timeLabel,link:i.link,sum:i.sum,
-            score:i.score,comments:i.comments,authors:i.authors||""})) };
-      }
-    });
-
-    const categories = (await Promise.all(categoryPromises)).filter(Boolean);
-    let intro = "";
-    try {
-      const top5 = categories
-        .flatMap(c => c.items || [])
-        .sort((a, b) => (b.heat || 0) - (a.heat || 0))
-        .slice(0, 5)
-        .map(i => i.title)
-        .join("\n");
-
-      intro = await groqChat(`You are writing a 2-sentence intro for a daily AI brief. Today's top stories are listed below. Pick the ONE story that actually matters to developers building AI products. Write it like a human talking to another developer — short, direct, no "as I review" or AI-sounding phrases. Just say what it is and why it matters. No fluff.\n\nTop stories:\n${top5}\n\nReturn ONLY 2 sentences. No intro, no sign-off.`,
-        { maxTokens:120, temperature:0.7, timeout:15000 });
-    } catch(e) {
-      console.warn("Intro generation failed:", e.message);
-    }
-
-    const digest = { intro, categories, generatedAt: new Date().toISOString(), feedAge: Math.round((Date.now() - CACHE.lastFetch)/1000) };
-    DIGEST_CACHE = { data:digest, ts:Date.now() };
-    res.json(digest);
+    const digest = await buildDigest(CACHE.items, groqChat, DIGEST_CACHE.data);
+    DIGEST_CACHE = { data: { ...digest, feedAge: Math.round((Date.now() - CACHE.lastFetch)/1000) }, ts: Date.now() };
+    res.json(DIGEST_CACHE.data);
   } catch(e) {
     console.error("Digest error:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
+setInterval(() => refresh().catch(e => console.error("Auto-refresh failed:", e.message)), 15 * 60 * 1000);
+
 // ── KEEP ALIVE (prevent Render free-tier sleep) ────────────────
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || null;
-
 if(SELF_URL) {
   setInterval(async () => {
     try { await fetch(`${SELF_URL}/health`); }
@@ -788,11 +169,5 @@ if(SELF_URL) {
 app.listen(PORT, () => {
   console.log(`\n🚀 Pulse backend — http://localhost:${PORT}\n`);
   pickGroqModel().catch(e => console.warn("Groq model pick failed:", e.message));
-  fetchAll().then(async items => {
-    CACHE.items=withWhys(items);
-    CACHE.lastFetch=Date.now();
-    await generateWhys(items);
-    CACHE.items=withWhys(items);
-    console.log("✅ Why cache applied to feed");
-  });
+  refresh().catch(e => console.error("Initial fetch failed:", e.message));
 });
