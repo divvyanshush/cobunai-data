@@ -335,7 +335,7 @@ const RSS_SOURCES = [
   { url:"https://lilianweng.github.io/index.xml", src:"LilianWeng", label:"Lilian Weng", aiOnly:true },
   { url:"https://karpathy.bearblog.dev/feed/", src:"Karpathy", label:"Andrej Karpathy", aiOnly:true },
   { url:"https://blog.langchain.dev/rss.xml", src:"LangChain", label:"LangChain Blog", aiOnly:true },
-  { url:"https://www.lesswrong.com/feed.xml", src:"LessWrong", label:"LessWrong", aiOnly:true },
+  { url:"https://www.lesswrong.com/feed.xml", src:"LessWrong", label:"LessWrong", aiOnly:false }, // mixes in non-AI posts
   { url:"https://alignmentforum.org/feed.xml", src:"AlignmentForum", label:"Alignment Forum", aiOnly:true },
 ];
 
@@ -485,7 +485,7 @@ function makeChat({ url, key="", model }) {
 }
 
 // Bump when prompts change — build.js drops AI text written by another model or prompt version
-const PROMPT_VERSION = 4;
+const PROMPT_VERSION = 5;
 
 // Cut at a word boundary — a word chopped mid-way gets copied into the output by small models
 const clip = (text, n) => {
@@ -499,6 +499,7 @@ const firstSentences = (text, n=2) => {
     .replace(/(^|\s)(\d{1,2}[.)]|[-*•])(?=\s)/g, " ") // list markers, inline or at line start
     .replace(/\*\*|__|`/g, "")
     .replace(/\b(first|second|sentence)( sentence)?\s*\d*\s*:\s*/gi, "")
+    .replace(/\b(why it matters|practical upshots?( for [^:.]{0,40})?)\s*:\s*/gi, "")
     .replace(/\s+/g, " ").trim();
   // Split only where a sentence end is followed by a new capitalised sentence, so "Qwen2.5" survives
   return flat.split(/(?<=[.!?])\s+(?=["“'(\[]?[A-Z0-9])/).slice(0, n).join(" ").trim();
@@ -568,7 +569,7 @@ async function buildDigest(items, chat, prev=null) {
       const prompt = `Today's top "${cat.label}" items for AI developers:
 ${topItems.map((i,idx) => `${idx+1}. ${i.title}${i.sum ? " — " + clip(i.sum, 140) : ""}`).join("\n")}
 
-Write a 2-sentence brief, each sentence under 25 words. Begin with the name of the single most important item above and say plainly what it is. The second sentence gives the practical upshot for someone building AI products, in your own words.
+Write a 2-sentence brief, each sentence under 25 words. Begin with the name of the single most important item above and say plainly what it is. The second sentence says what it changes for someone building AI products, in your own words.
 Use only facts stated above — never add numbers, names or details that are not there. Plain prose: no lists, no labels, no hype words, no preamble.`;
       try {
         summary = firstSentences(await chat(prompt, { maxTokens:160 }), 2);
