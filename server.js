@@ -1,17 +1,11 @@
 import express from "express";
-import { createClient } from "@supabase/supabase-js";
-import { Resend } from "resend";
 import cors from "cors";
-import fetch from "node-fetch";
 import Parser from "rss-parser";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import crypto from "crypto";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app    = express();
 const parser = new Parser({ timeout: 10000, headers: { "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" } });
-const PORT   = 3001;
+const PORT   = process.env.PORT || 3001;
 
 app.use(cors({ origin: "*" }));
 app.use(express.json());
@@ -33,21 +27,61 @@ const rateLimit = (key, maxReqs, windowMs) => {
 const CACHE = { items: [], lastFetch: 0 };
 const CACHE_TTL = 14 * 60 * 1000; // 14 min — just under auto-refresh interval
 
-// ── Bookmarks storage ─────────────────────────────────────────────
-const BOOKMARKS_FILE = path.join(__dirname, "bookmarks.json");
-function loadBookmarks() {
-  try {
-    if (fs.existsSync(BOOKMARKS_FILE)) {
-      return JSON.parse(fs.readFileSync(BOOKMARKS_FILE, "utf8"));
-    }
-  } catch(e) { console.warn("Could not load bookmarks:", e.message); }
-  return {};
+// ── Groq ──────────────────────────────────────────────────────────
+// Groq retires models without notice, so pick the first preferred one this key can use.
+const GROQ_PREFERRED = [
+  process.env.GROQ_MODEL,
+  "llama-3.3-70b-versatile",
+  "meta-llama/llama-4-maverick-17b-128e-instruct",
+  "meta-llama/llama-4-scout-17b-16e-instruct",
+  "moonshotai/kimi-k2-instruct-0905",
+  "moonshotai/kimi-k2-instruct",
+  "openai/gpt-oss-120b",
+  "llama-3.1-8b-instant",
+  "openai/gpt-oss-20b",
+].filter(Boolean);
+let GROQ_MODEL = null;
+
+async function pickGroqModel() {
+  if(!process.env.GROQ_API_KEY) throw new Error("GROQ_API_KEY not set");
+  const res = await fetch("https://api.groq.com/openai/v1/models", {
+    headers:{ "Authorization":"Bearer "+process.env.GROQ_API_KEY },
+    signal:AbortSignal.timeout(10000)
+  });
+  const data = await res.json();
+  if(!res.ok) throw new Error(`Groq models ${res.status}: ${data.error?.message||"unknown error"}`);
+  const ids = (data.data||[]).filter(m => m.active !== false).map(m => m.id);
+  GROQ_MODEL = GROQ_PREFERRED.find(m => ids.includes(m))
+    || ids.find(id => !/whisper|guard|tts|playai|orpheus|compound/i.test(id))
+    || null;
+  console.log(`🧠 Groq model: ${GROQ_MODEL||"none available"}`);
+  return GROQ_MODEL;
 }
-function saveBookmarks(bm) {
-  try { fs.writeFileSync(BOOKMARKS_FILE, JSON.stringify(bm, null, 2)); }
-  catch(e) { console.warn("Could not save bookmarks:", e.message); }
+
+async function groqChat(prompt, { maxTokens=200, temperature=0.3, timeout=20000 }={}) {
+  if(!process.env.GROQ_API_KEY) throw new Error("GROQ_API_KEY not set");
+  if(!GROQ_MODEL && !(await pickGroqModel())) throw new Error("No Groq chat model available");
+  // gpt-oss models spend tokens reasoning before answering
+  const reasoning = GROQ_MODEL.startsWith("openai/gpt-oss");
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method:"POST",
+    headers:{"Content-Type":"application/json","Authorization":"Bearer "+process.env.GROQ_API_KEY},
+    body:JSON.stringify({
+      model:GROQ_MODEL,
+      messages:[{role:"user",content:prompt}],
+      max_tokens: reasoning ? maxTokens + 400 : maxTokens,
+      temperature,
+      ...(reasoning ? { reasoning_effort:"low" } : {}),
+    }),
+    signal:AbortSignal.timeout(timeout)
+  });
+  const data = await res.json();
+  if(!res.ok) {
+    if(/model_not_found|model_decommissioned/.test(data.error?.code||"")) GROQ_MODEL = null; // re-pick next call
+    throw new Error(`Groq ${res.status}: ${data.error?.message||"unknown error"}`);
+  }
+  return data.choices?.[0]?.message?.content?.trim() || "";
 }
-let BOOKMARKS = loadBookmarks(); // { [itemId]: itemObject }
 
 // ── AI keyword filter ─────────────────────────────────────────────
 const AI_KW = [
@@ -86,7 +120,7 @@ const guessType = (t, body="", src="") => {
   // Model — specific model names anywhere in title
   if (/\bgpt-[\d.]|claude [\d]|claude opus|claude sonnet|claude haiku|gemini [\d.]|llama [\d]|llama-[\d]|mistral [\d]|deepseek-|deepseek [\d]|qwen[\d]|phi-[\d]|grok-[\d]|gpt-4|gpt-5|o1 |o3 |o1-|o3-/.test(title)) return "model";
   if (/\b(releases?|launches?|ships?|announces?|introduces?)\b.{0,30}\b(model|api|weights?)\b/.test(title)) return "model";
-  if (/open.?source[sd]?|open weight|model card|now available|available now/.test(title)) return "model";
+  if (/open.?(source[sd]?|weights?) .{0,20}\bmodel|model card|weights (are )?(now )?available/.test(title)) return "model";
 
   // Research — academic signals in title only (not body — too noisy)
   if (/\bpaper\b|\bsurvey\b|\bpreprint\b|\bbenchmark\b/.test(title)) return "research";
@@ -204,9 +238,9 @@ async function fetchHN() {
     fetch("https://hacker-news.firebaseio.com/v0/showstories.json", {signal:AbortSignal.timeout(10000)}).then(r=>r.json()),
   ]);
 
-  const topIds = topRes.status==="fulfilled" ? topRes.value.slice(0,200) : [];
-  const askIds = askRes.status==="fulfilled" ? askRes.value.slice(0,50) : [];
-  const showIds = showRes.status==="fulfilled" ? showRes.value.slice(0,50) : [];
+  const topIds = topRes.status==="fulfilled" ? topRes.value.slice(0,120) : [];
+  const askIds = askRes.status==="fulfilled" ? askRes.value.slice(0,30) : [];
+  const showIds = showRes.status==="fulfilled" ? showRes.value.slice(0,30) : [];
 
   const seen = new Set();
   const allIds = [...topIds, ...askIds, ...showIds].filter(id => {
@@ -215,9 +249,13 @@ async function fetchHN() {
     return true;
   });
 
-  const rows = await Promise.allSettled(allIds.map(id =>
-    fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`, {signal:AbortSignal.timeout(6000)}).then(r=>r.json())
-  ));
+  // Batches of 30 — firing ~300 requests at once times out on a small Render instance
+  const rows = [];
+  for(let i = 0; i < allIds.length; i += 30) {
+    rows.push(...await Promise.allSettled(allIds.slice(i, i+30).map(id =>
+      fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`, {signal:AbortSignal.timeout(8000)}).then(r=>r.json())
+    )));
+  }
   return rows
     .filter(r => r.status==="fulfilled" && r.value?.title && isAI(r.value.title))
     .map(({value:s}) => ({
@@ -318,7 +356,7 @@ async function fetchGitHub() {
       seen.add(repo.id);
       repos.push({
         id:`github-${repo.id}`, src:"GitHub", type:"repo",
-        title:`${repo.full_name} — ${repo.description||""}`.slice(0,100),
+        title:repo.full_name,
         sum:(repo.description||"No description.").slice(0,220),
         link:repo.html_url,
         time:Math.floor(new Date(repo.pushed_at||repo.updated_at).getTime()/1000),
@@ -334,10 +372,13 @@ async function fetchRSS(url, src, srcLabel, aiOnly=false, customHeaders={}) {
     ? new Parser({ timeout:10000, headers:{ "Accept":"application/rss+xml, application/atom+xml, application/xml, text/xml, */*", ...customHeaders } })
     : parser;
   const feed = await feedParser.parseURL(url);
-  return (feed.items||[]).slice(0, 20)
+  const pubTime = e => e.pubDate ? new Date(e.pubDate).getTime() : 0;
+  // Some feeds (OpenAI, HuggingFace) list hundreds of posts in no particular order
+  return [...(feed.items||[])].sort((a,b) => pubTime(b) - pubTime(a)).slice(0, 20)
     .filter(e => aiOnly || isAI(e.title||""))
     .map(e=>({
-      id:`${src.toLowerCase().replace(/\s/g,"-")}-${Buffer.from(e.link||e.title||"").toString("base64").slice(0,32)}`,
+      // Hash the whole link — a short prefix is identical for every post on a site
+      id:`${src.toLowerCase().replace(/\s/g,"-")}-${crypto.createHash("sha1").update(e.link||e.title||"").digest("hex").slice(0,16)}`,
       src, srcLabel:srcLabel||src, type:guessType(e.title||"", e.contentSnippet||e.summary||""), tags:guessTags(e.title||"", e.contentSnippet||e.summary||""),
       title:(e.title||"").replace(/\n/g," ").trim(),
       sum:safeText(e.contentSnippet||e.summary||e.content||"").slice(0,240)+"…",
@@ -348,16 +389,16 @@ async function fetchRSS(url, src, srcLabel, aiOnly=false, customHeaders={}) {
 
 const RSS_SOURCES = [
   { url:"https://openai.com/blog/rss.xml",                src:"OpenAI",      label:"OpenAI Blog",    aiOnly:true },
-  { url:"https://deepmind.google/blog/feed/basic/", src:"DeepMind", label:"DeepMind Blog", aiOnly:true },
+  // DeepMind gzips the body for non-browser user agents, which rss-parser can't read
+  { url:"https://deepmind.google/blog/rss.xml",           src:"DeepMind",    label:"DeepMind Blog",  aiOnly:true, headers:{ "User-Agent":"Mozilla/5.0 (compatible; CobunAI/1.0; +https://cobunai.com)" } },
+  { url:"https://research.google/blog/rss/",              src:"GoogleResearch", label:"Google Research", aiOnly:true },
   { url:"https://huggingface.co/blog/feed.xml",           src:"HuggingFace", label:"HuggingFace Blog",aiOnly:true },
-  { url:"https://venturebeat.com/category/ai/feed/",      src:"VentureBeat", label:"VentureBeat AI", aiOnly:true },
   { url:"https://techcrunch.com/category/artificial-intelligence/feed/", src:"TechCrunch", label:"TechCrunch AI", aiOnly:true },
   { url:"https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", src:"TheVerge", label:"The Verge AI", aiOnly:true },
   { url:"https://www.wired.com/feed/tag/ai/latest/rss",   src:"Wired",       label:"Wired AI",       aiOnly:true },
   { url:"https://www.technologyreview.com/feed/",         src:"MITReview",   label:"MIT Tech Review", aiOnly:true },
   { url:"https://simonwillison.net/atom/everything/",     src:"SimonW",      label:"Simon Willison",  aiOnly:true },
   { url:"https://www.interconnects.ai/feed",              src:"Interconnects",label:"Interconnects",  aiOnly:true },
-  { url:"https://blogs.microsoft.com/ai/feed/",           src:"Microsoft",   label:"Microsoft AI",    aiOnly:true },
   { url:"https://towardsdatascience.com/feed",            src:"TDS",         label:"Towards Data Science", aiOnly:true },
   { url:"https://www.marktechpost.com/feed/",             src:"MarkTechPost", label:"MarkTechPost",   aiOnly:true },
   { url:"https://bdtechtalks.com/feed/",                  src:"TechTalks",   label:"BD Tech Talks",   aiOnly:true },
@@ -365,10 +406,10 @@ const RSS_SOURCES = [
   { url:"https://lastweekin.ai/feed",                     src:"LastWeekInAI",label:"Last Week in AI", aiOnly:true },
   { url:"https://importai.substack.com/feed",             src:"ImportAI",    label:"Import AI",       aiOnly:true },
   { url:"https://www.together.ai/blog/rss.xml", src:"TogetherAI", label:"Together AI", aiOnly:true },
-  { url:"https://wandb.ai/fully-connected/rss.xml", src:"WandB", label:"Weights & Biases", aiOnly:true },
   { url:"https://magazine.sebastianraschka.com/feed", src:"Raschka", label:"Sebastian Raschka", aiOnly:true },
   { url:"https://lilianweng.github.io/index.xml", src:"LilianWeng", label:"Lilian Weng", aiOnly:true },
-  { url:"https://blog.langchain.dev/rss/", src:"LangChain", label:"LangChain Blog", aiOnly:true },
+  { url:"https://karpathy.bearblog.dev/feed/", src:"Karpathy", label:"Andrej Karpathy", aiOnly:true },
+  { url:"https://blog.langchain.dev/rss.xml", src:"LangChain", label:"LangChain Blog", aiOnly:true },
   { url:"https://www.lesswrong.com/feed.xml", src:"LessWrong", label:"LessWrong", aiOnly:true },
   { url:"https://alignmentforum.org/feed.xml", src:"AlignmentForum", label:"Alignment Forum", aiOnly:true },
 ];
@@ -515,18 +556,7 @@ Return ONLY a valid JSON object mapping id to sentence. Example: {"id1":"Cuts in
 Items:
 ${top30.map(i=>`{"id":"${i.id}","title":${JSON.stringify(i.title)},"sum":${JSON.stringify((i.sum||"").slice(0,120))}}`).join("\n")}`;
 
-    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method:"POST",
-      headers:{"Content-Type":"application/json","Authorization":"Bearer "+process.env.GROQ_API_KEY},
-      body:JSON.stringify({
-        model:"llama-3.1-8b-instant",
-        messages:[{role:"user",content:prompt}],
-        max_tokens:600,
-        temperature:0.2
-      })
-    });
-    const data = await res.json();
-    const raw = data.choices?.[0]?.message?.content?.trim()||"{}";
+    const raw = (await groqChat(prompt, { maxTokens:900, temperature:0.2, timeout:30000 })) || "{}";
     const clean = raw.replace(/```json|```/g,"").trim();
     let whys = {};
     try {
@@ -546,119 +576,19 @@ ${top30.map(i=>`{"id":"${i.id}","title":${JSON.stringify(i.title)},"sum":${JSON.
   }
 }
 
+const withWhys = items => items.map(i => ({ ...i, why: WHY_CACHE.get(i.id) || "" }));
+
 // ── Routes ─────────────────────────────────────────────────────────
-
-// Feed
-
-// ── Daily Briefing ──────────────────────────────────────────────
-// /briefing removed — use /digest
-if(false) app.get("/briefing", async (req, res) => {
-  res.set("Access-Control-Allow-Origin", "*");
-
-  // Cache for 30 minutes
-  if(BRIEFING_CACHE.data && Date.now() - BRIEFING_CACHE.ts < 15*60*1000) {
-    return res.json(BRIEFING_CACHE.data);
-  }
-
-  try {
-    const items = CACHE.items || [];
-    const now = Math.floor(Date.now()/1000);
-
-    // Briefing only shows real news/papers/blogs — not repos or HN discussions
-    const NEWS_SOURCES = [
-      "OpenAI","Anthropic","DeepMind","GoogleResearch","MetaAI","HuggingFace",
-      "Microsoft","TechCrunch","TheVerge","VentureBeat","MITReview","Wired",
-      "Interconnects","SimonW","ImportAI","TheSequence","LastWeekInAI",
-      "TDS","MarkTechPost","TechTalks","AINnews","arXiv","Dev.to","Mistral","Raschka","LilianWeng","Karpathy","FastAI","DeepLearningAI","LangChain","Cohere","WandB","TogetherAI"
-    ];
-    const last48h = items.filter(i => now - (i.time||0) < 172800);
-    const AI_RELEVANT = /ai|llm|gpt|claude|gemini|llama|mistral|model|neural|machine learning|deep learning|transformer|agent|inference|training|dataset|benchmark|openai|anthropic|deepmind|hugging/i;
-    const newsOnly = last48h.filter(i => NEWS_SOURCES.includes(i.src) && AI_RELEVANT.test(i.title));
-    // Enforce diversity — max 3 arXiv, max 4 of any single source
-    const sorted = [...newsOnly].sort((a,b)=>(b.heat||0)-(a.heat||0));
-    const srcCount = {};
-    const top10 = [];
-    for(const item of sorted) {
-      if(top10.length >= 10) break;
-      const src = item.src;
-      srcCount[src] = (srcCount[src]||0) + 1;
-      const maxForSrc = src==="arXiv" ? 3 : 4;
-      if(srcCount[src] > maxForSrc) continue;
-      top10.push(item);
-    }
-
-    if(!top10.length) return res.json({ items: [] });
-
-    // Generate "why this matters" for each via Groq
-    const prompt = `You are a principal engineer at a top AI lab. You read everything and cut through hype.
-Below are today's top AI signals. For each, write ONE punchy sentence (15-25 words) that tells an AI builder exactly why they should care.
-
-Rules:
-- Be concrete and specific — mention the actual impact, number, or capability
-- Speak to builders: "this means you can now...", "replaces X", "affects how you..."
-- No fluff like "groundbreaking" or "revolutionary"
-- If it's a paper, mention the key finding
-- If it's a model release, mention what changed vs before
-- If it's a tool, mention what problem it solves
-
-Items:
-${top10.map((i,idx)=>String(idx+1)+". ["+((i.type||"").toUpperCase())+"] "+i.title+"\n   "+((i.sum||"").slice(0,150))).join("\n\n")}
-
-Return ONLY a JSON array of 10 strings. No markdown, no explanation.
-Format: ["sentence1","sentence2",...]`;
-
-    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: 600,
-        temperature: 0.4
-      })
-    });
-
-    const groqData = await groqRes.json();
-    const raw = groqData.choices?.[0]?.message?.content?.trim() || "[]";
-    let whys = [];
-    try {
-      const clean = raw.replace(/```json|```/g,"").trim();
-      whys = JSON.parse(clean);
-    } catch(e) { whys = top10.map(()=>""); }
-
-    const briefing = {
-      date: new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"}).toUpperCase(),
-      items: top10.map((item,i) => ({
-        idx: i+1,
-        type: item.type,
-        title: item.title,
-        why: whys[i] || "",
-        src: item.src,
-        heat: item.heat,
-        link: item.link,
-        id: item.id
-      }))
-    };
-
-    BRIEFING_CACHE = { data: briefing, ts: Date.now() };
-    res.json(briefing);
-  } catch(e) {
-    console.error("Briefing error:", e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
 
 app.get("/feed", async (req, res) => {
   try {
     const now = Date.now();
-    if (now - CACHE.lastFetch < CACHE_TTL && CACHE.items.length > 0) {
+    // Auto-refresh keeps the cache fresh — never make a visitor wait on a full fetch if we have items
+    if (CACHE.items.length > 0) {
       return res.json({ items: CACHE.items, cached: true, age: Math.round((now-CACHE.lastFetch)/1000) });
     }
     const fetched = await fetchAll();
-    CACHE.items = fetched;
+    CACHE.items = withWhys(fetched);
     CACHE.lastFetch = Date.now();
     DIGEST_CACHE = { data: null, ts: 0 }; // invalidate digest when feed refreshes
     res.json({ items: CACHE.items, cached: false, age: 0 });
@@ -669,7 +599,7 @@ app.get("/feed", async (req, res) => {
 });
 
 // Health
-app.get("/health", (_, res) => res.json({ ok:true, items:CACHE.items.length, lastFetch:CACHE.lastFetch }));
+app.get("/health", (_, res) => res.json({ ok:true, items:CACHE.items.length, lastFetch:CACHE.lastFetch, model:GROQ_MODEL }));
 
 // Force cache refresh
 app.get("/refresh", async (req, res) => {
@@ -696,9 +626,6 @@ app.post("/summarize", async (req, res) => {
   const { title, sum, src, type } = req.body || {};
   if (!title) return res.status(400).json({ error: "title required" });
 
-  const GROQ_API_KEY = process.env.GROQ_API_KEY;
-  if (!GROQ_API_KEY) return res.status(500).json({ error: "GROQ_API_KEY not set" });
-
   try {
     const prompt = `You are a staff engineer who reads everything in AI. Be direct and technical.
 
@@ -717,57 +644,12 @@ Rules: no hype words, no "groundbreaking/revolutionary/exciting", be concrete, w
 
 Reply with ONLY the summary, no preamble, no bullet points.`;
 
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        max_tokens: 250,
-        temperature: 0.3,
-        messages: [{ role: "user", content: prompt }],
-      }),
-      signal: AbortSignal.timeout(20000),
-    });
-
-    if (!response.ok) {
-      const err = await response.text();
-      return res.status(502).json({ error: `Groq API error: ${err}` });
-    }
-
-    const data = await response.json();
-    const summary = data.choices?.[0]?.message?.content?.trim() || "Could not generate summary.";
+    const summary = (await groqChat(prompt, { maxTokens:250 })) || "Could not generate summary.";
     res.json({ summary });
   } catch(e) {
     console.error("Summarize error:", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(502).json({ error: e.message });
   }
-});
-
-// ── BOOKMARKS ─────────────────────────────────────────────────────
-// GET  /bookmarks          → { bookmarks: [item, …] }
-app.get("/bookmarks", (req, res) => {
-  res.json({ bookmarks: Object.values(BOOKMARKS) });
-});
-
-// POST /bookmarks          { item }  → saves item
-app.post("/bookmarks", (req, res) => {
-  const { item } = req.body || {};
-  if (!item?.id) return res.status(400).json({ error: "item.id required" });
-  BOOKMARKS[item.id] = { ...item, bookmarkedAt: Date.now() };
-  saveBookmarks(BOOKMARKS);
-  res.json({ ok: true, id: item.id });
-});
-
-// DELETE /bookmarks/:id   → removes bookmark
-app.delete("/bookmarks/:id", (req, res) => {
-  const id = decodeURIComponent(req.params.id);
-  if (!BOOKMARKS[id]) return res.status(404).json({ error: "not found" });
-  delete BOOKMARKS[id];
-  saveBookmarks(BOOKMARKS);
-  res.json({ ok: true, id });
 });
 
 // ── Auto-refresh cache ─────────────────────────────────────────────
@@ -779,14 +661,15 @@ setInterval(async () => {
       // If new fetch has no GitHub items but old cache did, preserve them
       const newGithub = newItems.filter(i => i.src === "GitHub");
       const oldGithub = CACHE.items.filter(i => i.src === "GitHub");
-      if(newGithub.length === 0 && oldGithub.length > 0) {
-        console.log("⚠️ GitHub fetch returned 0 — preserving previous GitHub items");
-        CACHE.items = [...newItems, ...oldGithub];
-      } else {
-        CACHE.items = newItems;
-      }
+      const merged = newGithub.length === 0 && oldGithub.length > 0
+        ? [...newItems, ...oldGithub]
+        : newItems;
+      if(merged !== newItems) console.log("⚠️ GitHub fetch returned 0 — preserving previous GitHub items");
+      CACHE.items = withWhys(merged);
       CACHE.lastFetch = Date.now();
       DIGEST_CACHE = { data: null, ts: 0 };
+      await generateWhys(merged);
+      CACHE.items = withWhys(merged);
       console.log(`✅ Cache refreshed — ${CACHE.items.length} items`);
     } else {
       console.log("⚠️ fetchAll returned empty — keeping existing cache");
@@ -795,73 +678,6 @@ setInterval(async () => {
     console.error("Auto-refresh failed:", e.message);
   }
 }, 15 * 60 * 1000);
-
-
-// ── TRENDING REPOS ─────────────────────────────────────────────
-let trendingCache = { data: [], ts: 0 };
-
-async function fetchTrendingRepos() {
-  try {
-    // Search for AI repos updated in last 24h, sorted by stars
-    const since = new Date(Date.now() - 24*60*60*1000).toISOString().split('T')[0];
-    const queries = [
-      "topic:llm+pushed:>" + since,
-      "topic:ai-agents+pushed:>" + since,
-      "topic:machine-learning+pushed:>" + since,
-    ];
-
-    const results = await Promise.allSettled(queries.map(q =>
-      fetch(`https://api.github.com/search/repositories?q=${q}&sort=stars&order=desc&per_page=10`, {
-        headers:{"Accept":"application/vnd.github.v3+json","User-Agent":"pulse-app/1.0"},
-        signal:AbortSignal.timeout(10000)
-      }).then(r=>r.json())
-    ));
-
-    const seen = new Set();
-    const repos = [];
-
-    for(const r of results) {
-      if(r.status !== "fulfilled") continue;
-      for(const repo of (r.value?.items||[])) {
-        if(seen.has(repo.id)) continue;
-        seen.add(repo.id);
-        repos.push({
-          id: repo.id,
-          name: repo.full_name,
-          description: (repo.description||"").slice(0,100),
-          stars: repo.stargazers_count||0,
-          forks: repo.forks_count||0,
-          url: repo.html_url,
-          language: repo.language||"",
-          topics: (repo.topics||[]).slice(0,3),
-          updatedAt: repo.updated_at,
-        });
-      }
-    }
-
-    // Sort by stars, take top 10
-    repos.sort((a,b) => b.stars - a.stars);
-    return repos.slice(0, 10);
-  } catch(e) {
-    console.warn("fetchTrendingRepos failed:", e.message);
-    return [];
-  }
-}
-
-app.get("/trending-repos", async (req, res) => {
-  try {
-    const now = Date.now();
-    if(now - trendingCache.ts < 10*60*1000 && trendingCache.data.length > 0) {
-      return res.json({ repos: trendingCache.data });
-    }
-    const repos = await fetchTrendingRepos();
-    trendingCache = { data: repos, ts: now };
-    res.json({ repos });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 
 
 // ── GET /digest — category summaries ─────────────────────────────
@@ -920,19 +736,13 @@ Rules:
 
 Reply with ONLY the 2-sentence summary.`;
       try {
-        const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-          method:"POST",
-          headers:{"Content-Type":"application/json","Authorization":`Bearer ${process.env.GROQ_API_KEY}`},
-          body:JSON.stringify({model:"llama-3.3-70b-versatile",messages:[{role:"user",content:prompt}],max_tokens:150,temperature:0.3}),
-          signal:AbortSignal.timeout(15000)
-        });
-        const d = await r.json();
-        const summary = d.choices?.[0]?.message?.content?.trim() || "";
+        const summary = await groqChat(prompt, { maxTokens:150, timeout:15000 });
         return { id:cat.id, label:cat.label, summary, count:catItems.length,
           items:catItems.map(i=>({id:i.id,title:i.title,src:i.src,srcLabel:i.srcLabel,type:i.type,
             heat:i.heat,time:i.time,timeLabel:i.timeLabel,link:i.link,sum:i.sum,
             score:i.score,comments:i.comments,authors:i.authors||""})) };
       } catch(e) {
+        console.warn(`Digest summary failed (${cat.id}):`, e.message);
         return { id:cat.id, label:cat.label, summary:"", count:catItems.length,
           items:catItems.map(i=>({id:i.id,title:i.title,src:i.src,srcLabel:i.srcLabel,type:i.type,
             heat:i.heat,time:i.time,timeLabel:i.timeLabel,link:i.link,sum:i.sum,
@@ -950,19 +760,8 @@ Reply with ONLY the 2-sentence summary.`;
         .map(i => i.title)
         .join("\n");
 
-      const introRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.GROQ_API_KEY}` },
-        body: JSON.stringify({
-          model: "llama-3.3-70b-versatile",
-          messages: [{ role: "user", content: `You are writing a 2-sentence intro for a daily AI brief. Today's top stories are listed below. Pick the ONE story that actually matters to developers building AI products. Write it like a human talking to another developer — short, direct, no "as I review" or AI-sounding phrases. Just say what it is and why it matters. No fluff.\n\nTop stories:\n${top5}\n\nReturn ONLY 2 sentences. No intro, no sign-off.` }],
-          max_tokens: 120,
-          temperature: 0.7
-        }),
-        signal: AbortSignal.timeout(10000)
-      });
-      const introData = await introRes.json();
-      intro = introData.choices?.[0]?.message?.content?.trim() || "";
+      intro = await groqChat(`You are writing a 2-sentence intro for a daily AI brief. Today's top stories are listed below. Pick the ONE story that actually matters to developers building AI products. Write it like a human talking to another developer — short, direct, no "as I review" or AI-sounding phrases. Just say what it is and why it matters. No fluff.\n\nTop stories:\n${top5}\n\nReturn ONLY 2 sentences. No intro, no sign-off.`,
+        { maxTokens:120, temperature:0.7, timeout:15000 });
     } catch(e) {
       console.warn("Intro generation failed:", e.message);
     }
@@ -976,76 +775,24 @@ Reply with ONLY the 2-sentence summary.`;
   }
 });
 
-// ── EMAIL DIGEST ───────────────────────────────────────────────
-
-
-const resend = new Resend(process.env.RESEND_API_KEY);
-
-app.post("/send-digest", async (req, res) => {
-  try {
-    const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-    const { data: users } = await supabase.auth.admin.listUsers();
-    const eligibleUsers = (users?.users || []).filter(u => u.email);
-    if(!eligibleUsers.length) return res.json({ ok: true, sent: 0 });
-
-    const digestRes = await fetch(`http://localhost:${PORT}/digest`);
-    const digest = await digestRes.json();
-    const allItems = (digest.categories || []).flatMap(c => c.items || []);
-    const byType = {};
-    for(const item of allItems) {
-      const t = item.type || 'other';
-      if(!byType[t]) byType[t] = [];
-      if(byType[t].length < 2) byType[t].push(item);
-    }
-    const picked = Object.values(byType).flat();
-    const pickedIds = new Set(picked.map(i => i.id));
-    const rest = allItems.filter(i => !pickedIds.has(i.id));
-    const top = [...picked, ...rest].slice(0, 8);
-    if(!top.length) return res.json({ ok: true, sent: 0 });
-
-    const typeColors = { model:"#6366f1", research:"#3b82f6", funding:"#f59e0b", tool:"#8b5cf6", policy:"#ef4444", discuss:"#6b7280", repo:"#10b981", drama:"#f97316" };
-    const rows = top.map(item => {
-      const color = typeColors[item.type] || "#8b5cf6";
-      return `<div style="padding:20px 0;border-bottom:1px solid #f0f0f0;"><span style="font-size:10px;padding:2px 8px;border-radius:3px;background:${color}18;color:${color};border:1px solid ${color}33;font-weight:700;letter-spacing:0.08em;">${(item.type||"").toUpperCase()}</span><br/><a href="${item.link}" style="color:#141414;text-decoration:none;font-size:15px;font-weight:600;line-height:1.5;display:block;margin:8px 0;">${item.title}</a><p style="color:#666;font-size:13px;line-height:1.6;margin:0;">${(item.sum||"").slice(0,200)}</p></div>`;
-    }).join("");
-
-    const today = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"/><link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet"/></head><body style="margin:0;padding:0;background:#f5f5f5;font-family:'IBM Plex Sans',Arial,sans-serif;"><div style="max-width:600px;margin:0 auto;background:#ffffff;"><div style="padding:32px 32px 24px;border-bottom:1px solid #ebebeb;"><div style="font-size:18px;font-weight:700;color:#141414;letter-spacing:0.15em;">COBUN AI</div><div style="font-size:12px;color:#888;margin-top:4px;">Today's AI signals — ${today}</div></div><div style="padding:8px 32px 24px;">${rows}</div><div style="padding:24px 32px;border-top:1px solid #ebebeb;text-align:center;background:#fafafa;"><a href="https://cobunai.com" style="display:inline-block;padding:10px 28px;background:#141414;color:#ffffff;font-size:12px;font-weight:600;text-decoration:none;border-radius:4px;letter-spacing:0.05em;">Open Cobun AI</a><p style="margin-top:16px;font-size:10px;color:#aaa;">You are receiving this as a Cobun AI user.</p></div></div></body></html>`;
-
-    let sent = 0;
-    for(const u of eligibleUsers) {
-      const text = top.map(item => `${(item.type||'').toUpperCase()}: ${item.title}\n${item.link}`).join('\n\n') + '\n\nUnsubscribe: https://cobunai.com/app';
-      await resend.emails.send({ from:"Cobun AI <digest@cobunai.com>", to:u.email, subject:`Cobun AI Daily — ${top.length} AI signals`, html: html + '<div style="text-align:center;margin-top:24px;"><a href="https://cobunai.com/app" style="font-size:10px;color:#444;text-decoration:underline;">Unsubscribe</a></div>', text });
-      sent++;
-    }
-    res.json({ ok: true, sent });
-  } catch(e) {
-    console.error("send-digest error:", e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── KEEP ALIVE (prevent Railway sleep) ─────────────────────────
-const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN 
-  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` 
-  : null;
+// ── KEEP ALIVE (prevent Render free-tier sleep) ────────────────
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || null;
 
 if(SELF_URL) {
   setInterval(async () => {
-    try { await fetch(`${SELF_URL}/health`); } 
+    try { await fetch(`${SELF_URL}/health`); }
     catch(e) {}
   }, 4 * 60 * 1000); // ping every 4 minutes
 }
 
-// duplicate health endpoint removed
-
 app.listen(PORT, () => {
   console.log(`\n🚀 Pulse backend — http://localhost:${PORT}\n`);
+  pickGroqModel().catch(e => console.warn("Groq model pick failed:", e.message));
   fetchAll().then(async items => {
-    CACHE.items=items.map(i=>({...i,why:""}));
+    CACHE.items=withWhys(items);
     CACHE.lastFetch=Date.now();
     await generateWhys(items);
-    CACHE.items=items.map(i=>({...i,why:WHY_CACHE.get(i.id)||""}));
+    CACHE.items=withWhys(items);
     console.log("✅ Why cache applied to feed");
   });
 });

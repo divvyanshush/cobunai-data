@@ -1,7 +1,7 @@
 {
   "name": "pulse-backend",
   "version": "1.0.0",
-  "description": "",
+  "description": "CobunAI backend — aggregates and summarises AI sources",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -12,11 +12,11 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "@supabase/supabase-js": "^2.99.2",
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "node-fetch": "^3.3.2",
-    "resend": "^6.9.3",
     "rss-parser": "^3.13.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
