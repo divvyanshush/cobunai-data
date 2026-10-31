@@ -709,9 +709,12 @@ function sentenceCase(headline, f) {
   const evidence = `${f.details} ${plainTitle ? words(f.title).slice(1).join(" ") : ""} ${slug.join(" ")}`;
   const text = `${f.source} ${f.title} ${f.details}`.toLowerCase();
   const makers = new Set(MAKERS.filter(([re]) => re.test(text)).flatMap(([, maker]) => maker.split(" ")));
-  return words(headline).map((w, wi) => w.split("-").map((part, pi) => {
+  const raw = `${f.title} ${f.details}`;
+  // A hyphenated name written exactly so in the item ("Gym-Anything") stays as it is
+  return words(headline).map((w, wi) => w.includes("-") && raw.includes(bare(w)) ? w : w.split("-").map((part, pi) => {
     const name = bare(part);
-    if((wi === 0 && pi === 0) || !/^[A-Z][a-z]+$/.test(name) || evidence.includes(name) || makers.has(name.toLowerCase())) return part;
+    // Whole words only: "Robotics" in the title is no reason to keep "Robot" capitalised
+    if((wi === 0 && pi === 0) || !/^[A-Z][a-z]+$/.test(name) || new RegExp(`\\b${name}\\b`).test(evidence) || makers.has(name.toLowerCase())) return part;
     return part.replace(name, name.toLowerCase());
   }).join("-")).join(" ");
 }
