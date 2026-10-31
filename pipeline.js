@@ -485,7 +485,7 @@ function makeChat({ url, key="", model }) {
 }
 
 // Bump when prompts change — build.js drops AI text written by another model or prompt version
-const PROMPT_VERSION = 6;
+const PROMPT_VERSION = 7;
 
 // Cut at a word boundary — a word chopped mid-way gets copied into the output by small models
 const clip = (text, n) => {
@@ -559,6 +559,8 @@ function storyFacts(i) {
     // A bare owner/repo slug gets copied into headlines — spell it out instead
     const [owner, name] = title.split("/");
     title = `GitHub repo ${name || owner} by ${owner}`;
+    // Descriptions arrive cut at 220 characters, often mid-word ("Google Work")
+    if((i.sum||"").length >= 220) details = details.replace(/\s+\S*$/, "…");
     details = `${details === "No description." ? "" : details} ${(i.score||0).toLocaleString("en-US")} stars.`.trim();
   } else if(i.src === "HN" || i.src === "Lobste.rs") {
     if(/^(Discussion on Hacker News|Technical discussion on Lobste\.rs)\.?$/.test(details)) details = "";
@@ -689,9 +691,11 @@ async function writeStory(cat, topItems, chat) {
   for(const temperature of [0.2, 0.6, 0.8, 0.8]) {
     const raw = await chat(STORY_PROMPT(cat.label, facts) + feedback, { maxTokens:160, temperature, json:true });
     const s = parseStory(raw) || {};
+    // Drop quotes only when they wrap the whole line — "with 'mass ulw'" keeps its closing quote
+    const unquote = t => t.trim().replace(/^(["'“‘])(.*)["'”’]$/, "$2").trim();
     const story = {
-      headline: firstSentences(String(s.headline||""), 1).replace(/[.!]+$/, "").replace(/^["']|["']$/g, "").trim(),
-      dek: firstSentences(String(s.dek||""), 1).replace(/^["']|["']$/g, "").trim(),
+      headline: unquote(firstSentences(String(s.headline||""), 1)).replace(/[.!]+$/, ""),
+      dek: unquote(firstSentences(String(s.dek||""), 1)),
     };
     if(story.dek && !/[.!?]$/.test(story.dek)) story.dek += ".";
     // Trust the words over the number: a story that plainly comes from another item is about that item
