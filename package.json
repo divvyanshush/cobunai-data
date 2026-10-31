@@ -1,5 +1,5 @@
 {
-  "name": "pulse-backend",
+  "name": "cobunai-data",
   "version": "1.0.0",
   "description": "CobunAI data — aggregates and summarises AI sources into static JSON",
   "main": "build.js",

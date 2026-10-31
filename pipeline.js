@@ -269,7 +269,7 @@ async function fetchGitHub() {
   const results = await Promise.allSettled(queries.map(q =>
     fetch(`https://api.github.com/search/repositories?q=${q}&sort=updated&order=desc&per_page=15`, {
       // Anonymous search allows 10 requests/min per IP — a token (free in GitHub Actions) avoids that
-      headers:{"Accept":"application/vnd.github.v3+json","User-Agent":"pulse-app/1.0",
+      headers:{"Accept":"application/vnd.github.v3+json","User-Agent":"cobunai-data/1.0",
         ...(process.env.GITHUB_TOKEN ? {"Authorization":"Bearer "+process.env.GITHUB_TOKEN} : {})},
       signal:AbortSignal.timeout(10000)
     }).then(r=>r.json())
