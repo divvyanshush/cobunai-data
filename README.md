@@ -6,9 +6,9 @@ Every hour a GitHub Action pulls ~26 curated sources (lab blogs, arXiv, Hacker N
 
 | File | What it holds |
 | --- | --- |
-| [`feed.json`](https://divvyanshush.github.io/pulse-backend/feed.json) | Every item: title, link, source, type, heat score, one-line "why it matters" |
-| [`digest.json`](https://divvyanshush.github.io/pulse-backend/digest.json) | Today's brief: an intro plus a 2-sentence summary per category |
-| [`status.json`](https://divvyanshush.github.io/pulse-backend/status.json) | When it last ran, items per source, which sources failed |
+| [`feed.json`](https://data.cobunai.com/feed.json) | Every item: title, link, source, type, heat score, one-line "why it matters" |
+| [`digest.json`](https://data.cobunai.com/digest.json) | Today's brief: an intro plus a 2-sentence summary per category |
+| [`status.json`](https://data.cobunai.com/status.json) | When it last ran, items per source, which sources failed |
 
 ## Run it yourself
 
