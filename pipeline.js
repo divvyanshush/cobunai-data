@@ -31,6 +31,13 @@ const AI_KW = [
 ];
 const isAI = t => { const s=(t||"").toLowerCase(); return AI_KW.some(k=>s.includes(k)); };
 
+// Where a source's posts go when no keyword rule fires — any other source falls back to Tools
+const SRC_HOME = {
+  DeepMind:"research", GoogleResearch:"research", LilianWeng:"research", // research write-ups
+  OpenAI:"funding",                                                       // customer stories, partnerships, company news
+  Karpathy:"discuss", Interconnects:"discuss",                            // personal essays, like LessWrong
+};
+
 const guessType = (t, body="", src="") => {
   const s = ((t||"")+" "+(body||"")).toLowerCase();
   const title = (t||"").toLowerCase();
@@ -40,25 +47,28 @@ const guessType = (t, body="", src="") => {
   if(src==="HN" || src==="Lobste.rs" || src==="LessWrong" || src==="AlignmentForum") return "discuss";
   if(src==="arXiv") return "research";
 
-  // Funding — very specific signals only
-  if (/series [abcde] |seed round|funding round|\$\d+[mb] raise|acqui[a-z]+ |merger|\bipo\b/.test(s)) return "funding";
+  // Funding — very specific signals only. Deal words count in the title only: essays "acquire resources", news mentions an IPO in passing
+  if (/series [abcde] |seed round|funding round|\$\d+[mb] raise/.test(s) || /acqui[a-z]+ |merger|\bipo\b/.test(title)) return "funding";
 
   // Model — specific model names anywhere in title
   if (/\bgpt-[\d.]|claude [\d]|claude opus|claude sonnet|claude haiku|gemini [\d.]|llama [\d]|llama-[\d]|mistral [\d]|deepseek-|deepseek [\d]|qwen[\d]|phi-[\d]|grok-[\d]|gpt-4|gpt-5|o1 |o3 |o1-|o3-/.test(title)) return "model";
-  if (/\b(releases?|launches?|ships?|announces?|introduces?)\b.{0,30}\b(model|api|weights?)\b/.test(title)) return "model";
+  // Lab titles run long: "Introducing WeatherNext 3, our most advanced and accurate global weather AI model"
+  if (/\b(releases?|launches?|ships?|announces?|introduces?|introducing|unveils?)\b.{0,70}\b(model|api|weights?)\b/.test(title)) return "model";
   if (/open.?(source[sd]?|weights?) .{0,20}\bmodel|model card|weights (are )?(now )?available/.test(title)) return "model";
+  // Hugging Face's "Welcome X" posts announce a model arriving on the Hub
+  if (src==="HuggingFace" && /^welcome\b/.test(title)) return "model";
 
   // Research — academic signals in title only (not body — too noisy)
   if (/\bpaper\b|\bsurvey\b|\bpreprint\b|\bbenchmark\b/.test(title)) return "research";
   if (/: a .{3,30} (approach|method|framework|system|model)$/i.test(t||"")) return "research";
 
-  // Policy
-  if (/regulation|eu ai act|senate|congress|executive order|copyright law|lawsuit|sued/.test(title)) return "policy";
+  // Policy — includes the training-data opt-out fight ("AI training preferences", "opt out of scraping")
+  if (/regulation|eu ai act|senate|congress|executive order|copyright|fair use|policymaker|lawsuit|sued|\bteens?\b|opt.?out|training preferences|scraping/.test(title)) return "policy";
 
   // Drama
   if (/fired|resign|scandal|layoff|laid off/.test(title)) return "drama";
 
-  return "tool";
+  return SRC_HOME[src] || "tool";
 };
 
 
