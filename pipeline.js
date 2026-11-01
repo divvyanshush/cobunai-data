@@ -36,6 +36,7 @@ const SRC_HOME = {
   DeepMind:"research", GoogleResearch:"research", LilianWeng:"research", // research write-ups
   OpenAI:"funding",                                                       // customer stories, partnerships, company news
   Karpathy:"discuss", Interconnects:"discuss",                            // personal essays, like LessWrong
+  TechCrunch:"funding", TheVerge:"funding", Wired:"funding", MITReview:"funding", // tech news: companies, markets, deals
 };
 
 const guessType = (t, body="", src="") => {
