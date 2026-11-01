@@ -2,9 +2,11 @@ name: Build data
 
 # Every hour: fetch all sources, write AI summaries with an open model running on the
 # runner itself (Ollama, no API key), and publish the JSON to GitHub Pages.
+# GitHub skips most scheduled runs, so the schedule tries every 10 minutes and the
+# check job lets a scheduled run build only when the published data is 50+ minutes old.
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "7,17,27,37,47,57 * * * *"
   workflow_dispatch:
   push:
     branches: [main]
@@ -24,7 +26,21 @@ env:
   LLM_MODEL: qwen2.5:7b
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      stale: ${{ steps.age.outputs.stale }}
+    steps:
+      - id: age
+        run: |
+          built=$(curl -sf https://data.cobunai.com/status.json | jq -r .generatedAt) || built=""
+          age=$(( $(date +%s) - $(date -d "${built:-1970-01-01}" +%s) ))
+          echo "Published data is $((age / 60)) minutes old"
+          echo "stale=$([ "$age" -ge 3000 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.stale == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment:
