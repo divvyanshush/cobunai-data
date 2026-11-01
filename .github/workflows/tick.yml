@@ -1,0 +1,27 @@
+name: Hourly tick
+
+# GitHub's cron skips most runs, so this keeps the hourly build going by itself.
+# The job waits on the "hourly" environment's 55-minute wait timer (no runner is used
+# while it waits), then starts a data build and the next tick. build.yml restarts the
+# chain whenever no tick is waiting.
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+concurrency:
+  group: tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: hourly
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run build.yml -R "$GITHUB_REPOSITORY" --ref main
+          gh workflow run tick.yml -R "$GITHUB_REPOSITORY" --ref main

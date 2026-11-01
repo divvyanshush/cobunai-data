@@ -24,4 +24,4 @@ ollama pull qwen2.5:7b
 LLM_URL=http://localhost:11434/v1 LLM_MODEL=qwen2.5:7b npm run build
 ```
 
-Sources and scoring live in [`pipeline.js`](pipeline.js); the schedule in [`.github/workflows/build.yml`](.github/workflows/build.yml).
+Sources and scoring live in [`pipeline.js`](pipeline.js); the build in [`.github/workflows/build.yml`](.github/workflows/build.yml). [`tick.yml`](.github/workflows/tick.yml) starts it about every hour: its job waits on the `hourly` environment's 55-minute wait timer, then starts a build and the next tick, because GitHub's own cron skips most runs.

@@ -2,8 +2,9 @@ name: Build data
 
 # Every hour: fetch all sources, write AI summaries with an open model running on the
 # runner itself (Ollama, no API key), and publish the JSON to GitHub Pages.
-# GitHub skips most scheduled runs, so the schedule tries every 10 minutes and the
-# check job lets a scheduled run build only when the published data is 50+ minutes old.
+# GitHub skips most scheduled runs, so tick.yml starts a build about every hour. The
+# schedule is a backup: it tries every 10 minutes, and the check job lets a scheduled run
+# build only when the published data is 50+ minutes old.
 on:
   schedule:
     - cron: "7,17,27,37,47,57 * * * *"
@@ -37,6 +38,14 @@ jobs:
           age=$(( $(date +%s) - $(date -d "${built:-1970-01-01}" +%s) ))
           echo "Published data is $((age / 60)) minutes old"
           echo "stale=$([ "$age" -ge 3000 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the hourly tick going
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          active=$(gh run list -R "$GITHUB_REPOSITORY" --workflow tick.yml --limit 20 --json status --jq '[.[] | select(.status != "completed")] | length')
+          echo "Ticks waiting or running: $active"
+          [ "$active" -gt 0 ] || gh workflow run tick.yml -R "$GITHUB_REPOSITORY" --ref main
 
   build:
     needs: check
